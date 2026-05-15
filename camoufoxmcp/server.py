@@ -91,8 +91,9 @@ async def _safe(handler, *args, **kwargs) -> dict[str, Any]:
 # -----------------------------------------------------------------------
 
 def _is_cloudflare_blocked(title: str, url: str) -> bool:
-    cf_titles = {"just a moment", "checking your browser", "cloudflare", "attention required"}
-    return title.lower() in cf_titles or "cloudflare" in title.lower()
+    title_lower = title.lower()
+    cf_patterns = {"just a moment", "checking your browser", "cloudflare", "attention required"}
+    return any(p in title_lower for p in cf_patterns)
 
 
 async def _run_in_executor(self, func, *args, **kwargs):

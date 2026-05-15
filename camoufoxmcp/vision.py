@@ -1,13 +1,13 @@
-"""Annotated screenshots with element indices overlaid."""
+"""Annotated screenshots."""
 
 from __future__ import annotations
 
 import uuid
-from pathlib import Path
+from typing import Any
 
 
 async def take_screenshot(page: Any, full_page: bool = False) -> dict[str, Any]:
-    """Take an annotated screenshot showing element indices.
+    """Take a screenshot of the page.
 
     Returns:
         {
@@ -23,29 +23,7 @@ async def take_screenshot(page: Any, full_page: bool = False) -> dict[str, Any]:
     else:
         await page.screenshot(path=path)
 
-    # Count visible elements for annotation context
-    try:
-        tree = await page.accessibility.snapshot()
-        count = _count_interactive(tree)
-    except Exception:
-        count = 0
-
     return {
         "status": "ok",
         "path": path,
-        "element_count": count,
     }
-
-
-def _count_interactive(node: dict) -> int:
-    if node is None:
-        return 0
-    role = node.get("role", "").lower()
-    interactive = role in {
-        "button", "link", "checkbox", "radio", "textbox", "combobox",
-        "menuitem", "tab", "switch",
-    }
-    count = 1 if interactive else 0
-    for child in node.get("children", []):
-        count += _count_interactive(child)
-    return count
