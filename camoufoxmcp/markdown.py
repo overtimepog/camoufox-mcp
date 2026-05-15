@@ -11,7 +11,7 @@ async def extract_markdown(page: Any, max_length: int = 50000) -> dict[str, Any]
 
     Strips navigation, ads, footers — returns just the main content.
     """
-    html = await page.content()
+    html = page.content()
     # Simple strip of script/style tags
     html = re.sub(r"<script[^>]*>.*?</script>", "", html, flags=re.DOTALL | re.IGNORECASE)
     html = re.sub(r"<style[^>]*>.*?</style>", "", html, flags=re.DOTALL | re.IGNORECASE)

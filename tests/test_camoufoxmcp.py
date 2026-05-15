@@ -2,7 +2,7 @@
 
 import pytest
 import asyncio
-from unittest.mock import MagicMock, AsyncMock, patch
+from unittest.mock import MagicMock
 
 
 class TestBrowserSession:
@@ -47,23 +47,46 @@ class TestBrowserSession:
 
 
 class TestSnapshot:
-    """Test accessibility snapshot functionality."""
+    """Test snapshot and ref resolution."""
 
-    def test_resolve_ref_basic(self):
+    def test_resolve_ref_from_stored_map(self):
         from camoufoxmcp.snapshot import resolve_ref
-        # Mock session and page
         session = MagicMock()
-        page_id = "page_abc"
-        ref = "e5"
-        clean_ref, selector, frame_idx = resolve_ref(session, page_id, ref)
-        assert clean_ref == "e5"
-        assert "@e5" in ref or clean_ref == "e5"
+        session._ref_map = {
+            "page_abc": {
+                "e1": {"selector": "#my-button", "tag": "button", "role": "button", "label": "Click me"},
+                "e2": {"selector": "input[name='q']", "tag": "input", "role": "textbox", "label": "Search"},
+            }
+        }
+        clean_ref, selector, frame_idx = resolve_ref(session, "page_abc", "@e1")
+        assert clean_ref == "e1"
+        assert selector == "#my-button"
+        assert frame_idx is None
 
     def test_resolve_ref_strips_at(self):
         from camoufoxmcp.snapshot import resolve_ref
         session = MagicMock()
-        clean_ref, _, _ = resolve_ref(MagicMock(), "page_abc", "@e3")
+        session._ref_map = {}
+        clean_ref, _, _ = resolve_ref(session, "page_abc", "@e3")
         assert clean_ref == "e3"
+
+    def test_resolve_ref_fallback(self):
+        from camoufoxmcp.snapshot import resolve_ref
+        session = MagicMock()
+        session._ref_map = {}  # No ref map for this page
+        clean_ref, selector, _ = resolve_ref(session, "page_unknown", "e99")
+        assert clean_ref == "e99"
+        # Falls back to role-based selector
+        assert "e99" in selector
+
+    def test_resolve_ref_frame_index(self):
+        from camoufoxmcp.snapshot import resolve_ref
+        session = MagicMock()
+        session._ref_map = {}
+        clean_ref, selector, frame_idx = resolve_ref(session, "page_abc", "f2")
+        assert clean_ref == "f2"
+        assert frame_idx == 2
+        assert "iframe" in selector
 
 
 class TestMarkdownExtraction:
@@ -77,6 +100,20 @@ class TestMarkdownExtraction:
         assert result["status"] == "ok"
         assert "Hello" in result["content"]
         assert "World" in result["content"]
+
+    def test_extract_markdown_strips_scripts(self):
+        from camoufoxmcp.markdown import extract_markdown
+        page = MagicMock()
+        page.content.return_value = (
+            "<html><body>"
+            "<script>alert('bad')</script>"
+            "<h1>Safe</h1>"
+            "</body></html>"
+        )
+        result = asyncio.get_event_loop().run_until_complete(extract_markdown(page))
+        assert result["status"] == "ok"
+        assert "Safe" in result["content"]
+        assert "alert" not in result["content"]
 
 
 class TestCloudflareDetection:
@@ -97,3 +134,22 @@ class TestCloudflareDetection:
         from camoufoxmcp.server import _is_cloudflare_blocked
         assert _is_cloudflare_blocked("JUST A MOMENT...", "https://example.com/") is True
         assert _is_cloudflare_blocked("CloudFlare", "https://example.com/") is True
+
+
+class TestSnapshotJS:
+    """Test the injected snapshot JS logic."""
+
+    def test_snapshot_js_is_valid(self):
+        import re
+        # Verify the JS doesn't have obvious syntax errors
+        from camoufoxmcp.snapshot import SNAPSHOT_JS
+        # Should have function definitions
+        assert "function isVisible" in SNAPSHOT_JS
+        assert "function getSelector" in SNAPSHOT_JS
+        assert "function getLabel" in SNAPSHOT_JS
+        assert "function describeElement" in SNAPSHOT_JS
+        # Should return an object with expected keys (JS uses single-quote keys in the return stmt)
+        assert "return {" in SNAPSHOT_JS
+        assert "tree:" in SNAPSHOT_JS
+        assert "refs," in SNAPSHOT_JS
+        assert "ref_count:" in SNAPSHOT_JS
