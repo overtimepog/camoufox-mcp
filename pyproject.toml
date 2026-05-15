@@ -1,0 +1,63 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "camoufox-mcp"
+version = "0.1.0"
+description = "Camoufox MCP server — stealth Playwright browser automation for AI agents, with Cloudflare bypass and human-verification delegation"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+authors = [
+    { name = "overtimepog" },
+]
+keywords = [
+    "mcp",
+    "model-context-protocol",
+    "camoufox",
+    "stealth",
+    "browser",
+    "playwright",
+    "automation",
+    "ai-agent",
+    "web-scraping",
+    "anti-detect",
+    "cloudflare",
+    "human-verification",
+    "cf-challenge",
+    "recaptcha",
+    "turnstile",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: WWW/HTTP :: Browsers",
+    "Topic :: Software Development :: Testing",
+]
+dependencies = [
+    "mcp>=1.20,<2.0",
+    "camoufox>=0.4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+]
+
+[project.scripts]
+camoufox-mcp = "camoufoxmcp.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["camoufoxmcp"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
