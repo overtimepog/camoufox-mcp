@@ -116,7 +116,7 @@ def create_server(caps: set[str] | None = None):
         instructions=(
             "Camoufox — stealth browser automation powered by Camoufox (humanized Playwright Firefox fork).\n\n"
             "WORKFLOW:\n"
-            "1. camoufox_launch() — start stealth browser (auto-creates first page)\n"
+            "1. camoufox_launch(display_mode='headed') — start browser (use 'headed' for visible window, 'headless' for invisible)\n"
             "2. camoufox_navigate(page_id, url) — go to URL (auto-waits for settle)\n"
             "3. camoufox_snapshot(page_id) — get interactive elements as [@eN] refs\n"
             "4. camoufox_click(page_id, '@e5') — click by ref\n"
@@ -124,6 +124,10 @@ def create_server(caps: set[str] | None = None):
             "6. camoufox_read_page(page_id) — page as clean markdown\n"
             "7. camoufox_screenshot(page_id) — annotated screenshot\n"
             "8. camoufox_close() — done\n\n"
+            "DISPLAY MODE:\n"
+            "'headless' (default): invisible browser, best for background automation.\n"
+            "'headed': visible window, useful when Cloudflare blocks and human verification\n"
+            "is needed in a real browser, or for visual debugging.\n\n"
             "HUMAN VERIFICATION (Cloudflare blocks automation):\n"
             "If camoufox_navigate returns cloudflare_blocked=true, call:\n"
             "  camoufox_snapshot_if_blocked(page_id) → gets verification URL + user instruction\n"
@@ -140,7 +144,7 @@ def create_server(caps: set[str] | None = None):
 
     @mcp.tool()
     async def camoufox_launch(
-        headless: bool = True,
+        display_mode: str = "headless",
         proxy: str | None = None,
         humanize: bool = True,
         human_preset: str = "default",
@@ -159,8 +163,10 @@ def create_server(caps: set[str] | None = None):
         Cloudflare challenges and fingerprint checks.
 
         Args:
-            headless: Run headless (default: True). Set False for headed debugging.
-            proxy: Proxy URL e.g. 'http://user:pass@proxy:8080'.
+            display_mode: 'headless' (default, invisible) or 'headed' (visible window).
+                Agent can switch modes per-task — headed is useful when Cloudflare blocks
+                and human verification is needed, or for visual debugging.
+            proxy: Proxy URL e.g. 'http://user:***@proxy:8080'.
             humanize: Human-like mouse/keyboard/scroll (default: True).
             human_preset: 'default' or 'careful' (slower).
             timezone: IANA timezone e.g. 'America/New_York'.
@@ -171,6 +177,8 @@ def create_server(caps: set[str] | None = None):
             user_agent: Custom user agent override.
             user_data_dir: Persistent profile path (cookies survive restarts).
         """
+        headless = display_mode != "headed"
+
         if _session.is_running:
             return {"status": "already_running", "pages": _session.list_pages()}
 
@@ -198,6 +206,7 @@ def create_server(caps: set[str] | None = None):
         return {
             "status": "launched",
             "page_id": page_id,
+            "display_mode": display_mode,
             "stealth": True,
             "humanize": humanize,
             "hint": "Next: call camoufox_navigate(page_id, url)",

@@ -65,10 +65,15 @@ class BrowserSession:
         self._pages: dict[str, Any] = {}
         self._page_ids: list[str] = []
         self._executor: ThreadPoolExecutor | None = None
+        self._display_mode: str = "headless"
 
     @property
     def is_running(self) -> bool:
         return self._browser is not None and self._context is not None
+
+    @property
+    def display_mode(self) -> str:
+        return self._display_mode
 
     async def launch(self, cfg: SessionConfig, executor: ThreadPoolExecutor) -> None:
         """Launch Camoufox browser in the thread executor.
@@ -79,6 +84,7 @@ class BrowserSession:
             await self.close()
 
         self._executor = executor
+        self._display_mode = "headed" if not cfg.headless else "headless"
 
         def _sync_launch():
             from camoufox.sync_api import Camoufox
