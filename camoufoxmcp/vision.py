@@ -6,7 +6,7 @@ import uuid
 from typing import Any
 
 
-async def take_screenshot(page: Any, full_page: bool = False) -> dict[str, Any]:
+def take_screenshot(page: Any, full_page: bool = False) -> dict[str, Any]:
     """Take a screenshot of the page.
 
     Returns:
@@ -19,9 +19,9 @@ async def take_screenshot(page: Any, full_page: bool = False) -> dict[str, Any]:
     path = f"/tmp/camoufox_screenshot_{uuid.uuid4().hex[:6]}.png"
 
     if full_page:
-        await page.screenshot(path=path, full_page=True)
+        page.screenshot(path=path, full_page=True)
     else:
-        await page.screenshot(path=path)
+        page.screenshot(path=path)
 
     return {
         "status": "ok",

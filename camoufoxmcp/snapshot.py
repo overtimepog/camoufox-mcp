@@ -203,7 +203,7 @@ SNAPSHOT_JS = r"""
 """
 
 
-async def take_snapshot(page: Any, page_id: str, session: Any, full: bool = False, max_length: int = 12000) -> dict[str, Any]:
+def take_snapshot(page: Any, page_id: str, session: Any, full: bool = False, max_length: int = 12000) -> dict[str, Any]:
     """Capture accessibility tree with real CSS selectors per ref.
 
     Returns:

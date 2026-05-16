@@ -6,7 +6,7 @@ import re
 from typing import Any
 
 
-async def extract_markdown(page: Any, max_length: int = 50000) -> dict[str, Any]:
+def extract_markdown(page: Any, max_length: int = 50000) -> dict[str, Any]:
     """Extract page content as clean, readable markdown.
 
     Strips navigation, ads, footers — returns just the main content.
