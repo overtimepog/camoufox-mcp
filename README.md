@@ -1,11 +1,12 @@
 # Camoufox MCP
 
-> Stealth browser automation MCP server powered by [Camoufox](https://github.com/askjoe/camoufox) — a humanized Playwright Firefox fork with **two-tier Cloudflare bypass**.
+> Stealth browser automation MCP server powered by [Camoufox](https://github.com/askjoe/camoufox) — a humanized Playwright Firefox fork with **two-tier Cloudflare bypass** including full browser session recovery through route interception.
 
 ## Features
 
 - **Stealth by default** — randomized viewports, real human mouse/keyboard patterns, spoofed fingerprints
-- **Two-tier Cloudflare bypass** — cloudscraper (fast HTTP) → FlareSolverr (guaranteed)
+- **Two-tier Cloudflare bypass** — cloudscraper (fast HTTP) → FlareSolverr (guaranteed, with browser recovery)
+- **Full browser session recovery** — `flaresolverr_solve` sets up Playwright route interception so the entire browser session works through FlareSolverr: navigate, snapshot, click, type — all transparent
 - **Ref-based interaction** — snapshot-first: `[@eN]` refs from accessibility tree, no CSS selectors
 - **Auto-managed FlareSolverr** — Tier 2 automatically starts/stops Docker container on demand
 - **Persistent sessions** — cookies survive restarts via `user_data_dir`
@@ -36,7 +37,7 @@ Tier 2 uses FlareSolverr (Docker-based headless Chromium) to bypass Turnstile, J
 # First Tier 2 call auto-pulls the image and starts the container.
 ```
 
-## Tools (21 total)
+## Tools (22 total)
 
 ### Browser Lifecycle
 | Tool | Description |
@@ -67,11 +68,12 @@ Tier 2 uses FlareSolverr (Docker-based headless Chromium) to bypass Turnstile, J
 
 ### Cloudflare Bypass — Two Tiers
 
-| Tier | Tool | Speed | What it solves |
-|------|------|-------|----------------|
-| 1 | `camoufox_cloudscraper_fetch` | ~100—500ms | IUAM, JS v1, JS v2 |
+| Tier | Tool | Speed | What it does |
+|------|------|-------|---------------|
+| 1 | `camoufox_cloudscraper_fetch` | ~100—500ms | HTTP-level JS solver: IUAM, JS v1, JS v2 |
 |   | `camoufox_cloudscraper_solve` | ~1—2s | Cookie injection into browser |
-| 2 | `camoufox_flaresolverr_fetch` | ~1—15s | Turnstile, JS VM v3, CAPTCHA (everything) |
+| 2 | `camoufox_flaresolverr_fetch` | ~1—15s | Turnstile, JS VM v3, CAPTCHA — returns content + links |
+|   | `camoufox_flaresolverr_solve` | ~1—15s | **Full browser recovery via route interception** — browser works normally after |
 
 | Tool | Description |
 |------|-------------|
@@ -81,19 +83,26 @@ Tier 2 uses FlareSolverr (Docker-based headless Chromium) to bypass Turnstile, J
 
 ## Cloudflare Bypass Workflow
 
-When `camoufox_navigate` returns `cloudflare_blocked: true`, escalate through the tiers:
+When `camoufox_navigate` returns `cloudflare_blocked: true`:
 
+### Fetch content only (fast, no browser needed)
 ```
-Tier 1: cloudscraper_fetch(url)
-  → Fast HTTP-level JS solver. Covers most CF protections.
-  → Also: cloudscraper_solve(page_id) to inject cookies into browser.
-  → If blocked: Tier 2
+flaresolverr_fetch(url) → content + links array
+  Returns a 'links' array for directory discovery (supports <a href> and phx-click).
+```
 
-Tier 2: flaresolverr_fetch(url)
-  → Docker-based headless Chromium + puppeteer-extra stealth.
-  → Auto-starts FlareSolverr if not running.
-  → Bypasses Turnstile, JS VM v3, managed challenges, CAPTCHAs.
-  → Guaranteed bypass for all known CF protections.
+### Full browser session recovery (the browser works normally after)
+```
+navigate → cf_blocked
+  → flaresolverr_solve(page_id) → routes_active: true
+  → navigate (same URL) → page loads!  ← CF bypassed transparently
+  → snapshot / click / type / read_page — all work normally
+  
+How it works:
+  flare_solve sets up Playwright route interception — ALL document requests
+  to the CF-protected domain are proxied through FlareSolverr's headless
+  Chromium (which has CF clearance). Subresources load directly for speed.
+  The browser renders normally — no tools behave differently.
 ```
 
 ### Example
@@ -103,13 +112,18 @@ Tier 2: flaresolverr_fetch(url)
 result = camoufox_navigate("page_abc", "https://vx-underground.org/")
 
 if result.get("cloudflare_blocked"):
-    # Tier 1: fast HTTP solver
-    content = camoufox_cloudscraper_fetch("https://vx-underground.org/")
+    # Recover full browser session — routes ALL requests through FlareSolverr
+    camoufox_flaresolverr_solve(page_id="page_abc")
 
-    if content.get("status") == "cf_blocked":
-        # Tier 2: guaranteed bypass (auto-starts Docker if needed)
-        content = camoufox_flaresolverr_fetch("https://vx-underground.org/")
-        # → Returns real page content + cf_clearance cookie
+    # Now navigate normally — FlareSolverr handles CF transparently
+    camoufox_navigate("page_abc", "https://vx-underground.org/")
+    # → cloudflare_blocked: false, title: "Vx Underground"
+
+    # All normal tools work:
+    camoufox_snapshot("page_abc")     # 21 interactive elements
+    camoufox_read_page("page_abc")    # Full content
+    camoufox_click("page_abc", "@e8") # Click file entries
+    camoufox_scroll("page_abc")       # Scroll normally
 ```
 
 ## Architecture
@@ -117,15 +131,15 @@ if result.get("cloudflare_blocked"):
 ```
 camoufox-mcp/
 ├── camoufoxmcp/
-│   ├── __init__.py              # v0.3.1
+│   ├── __init__.py              # v0.4.0
 │   ├── __main__.py              # Entry point
-│   ├── server.py                # FastMCP server + 21 tool definitions
+│   ├── server.py                # FastMCP server + 22 tool definitions
 │   ├── session.py               # BrowserSession lifecycle (Camoufox Firefox)
 │   ├── snapshot.py              # Accessibility-tree snapshot + ref resolution
 │   ├── markdown.py              # Clean markdown extraction
 │   ├── vision.py                # Annotated screenshots
 │   ├── cloudscraper_bridge.py   # Tier 1: HTTP JS solver + cookie injection
-│   └── flaresolverr_bridge.py   # Tier 2: Docker Chromium, Docker lifecycle mgmt
+│   └── flaresolverr_bridge.py   # Tier 2: solve, fetch (raw + text), links, Docker mgmt
 ├── pyproject.toml
 └── tests/
 ```
@@ -146,6 +160,7 @@ pytest tests/
 | Engine | Source-patched Chromium | Humanized Playwright (Firefox/Chromium) |
 | Cloudflare | Passes Turnstile/reCAPTCHA | Two-tier bypass: cloudscraper → FlareSolverr |
 | CF auto-management | Manual cookie import | Auto-start/stop Docker FlareSolverr |
+| Browser recovery | N/A | Route interception: `flaresolverr_solve` recovers the entire browsing session |
 | Maintenance | You maintain the fork | Active upstreams (askjoe, cloudscraper, FlareSolverr) |
 | Platforms | Linux/Windows/macOS | Linux/Windows/macOS |
 

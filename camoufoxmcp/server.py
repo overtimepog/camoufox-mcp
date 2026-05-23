@@ -23,6 +23,8 @@ from .vision import take_screenshot
 from .cloudscraper_bridge import fetch_via_cloudscraper, solve_and_inject
 from .flaresolverr_bridge import (
     fetch_via_flaresolverr,
+    fetch_raw_via_flaresolverr,
+    solve_via_flaresolverr,
     check_flaresolverr_health,
     start_flaresolverr,
     stop_flaresolverr,
@@ -449,6 +451,9 @@ def create_server(caps: set[str] | None = None):
 
         Slower than cloudscraper (1-10s vs 50-500ms) but bypasses everything.
 
+        Returns a 'links' array with structured link data — use this to
+        discover files/pages in directory listings (like VX-Underground).
+
         Start FlareSolverr (one-time):
           docker run -d --restart unless-stopped -p 8191:8191 flaresolverr/flaresolverr:latest
 
@@ -479,6 +484,131 @@ def create_server(caps: set[str] | None = None):
             "http://localhost:8191/v1",
             proxy,
         )
+
+    @mcp.tool()
+    async def camoufox_flaresolverr_solve(
+        page_id: str,
+        url: str | None = None,
+        proxy: str | None = None,
+        max_timeout: int = 60000,
+    ) -> dict[str, Any]:
+        """Use FlareSolverr to bypass Cloudflare — sets up persistent proxy routing.
+
+        This is the ULTIMATE Cloudflare bypass for Camoufox browser. Instead
+        of just injecting cookies (which fail due to fingerprint binding),
+        this tool sets up Playwright route interception: ALL requests to the
+        CF-protected domain are proxied through FlareSolverr's headless
+        Chromium, which has CF clearance.
+
+        After this call, the browser can navigate the target domain normally:
+        camoufox_navigate(), camoufox_click(), camoufox_snapshot() — all
+        work because network traffic flows through FlareSolverr.
+
+        Workflow:
+        1. camoufox_launch() → navigate → cf_blocked
+        2. camoufox_flaresolverr_solve(page_id) → routes set up
+        3. camoufox_navigate(page_id, same URL) → page loads!
+        4. All subsequent navigation/clicks on that domain → transparent
+
+        Args:
+            page_id: Page ID from the browser session.
+            url: Target URL (defaults to current page URL).
+            proxy: Optional proxy URL for FlareSolverr.
+            max_timeout: Max solve time in ms (default: 60000).
+
+        Returns:
+            {
+                "status": "ok" | "cf_blocked" | "error",
+                "domain": "example.com",
+                "routes_active": True,
+                "next_step": "Call camoufox_navigate() — all requests proxied through FlareSolverr",
+            }
+        """
+        page = _session.get_page(page_id)
+        target_url = url or page.url
+        loop = asyncio.get_event_loop()
+
+        def _solve_and_setup_proxy():
+            from urllib.parse import urlparse
+            import re as _re
+
+            # Step 1: Prime FlareSolverr — solve CF for this domain
+            solve_result = solve_via_flaresolverr(
+                target_url, max_timeout,
+                "http://localhost:8191/v1", proxy,
+            )
+            if solve_result.get("status") != "ok":
+                return solve_result
+
+            # Step 2: Inject cookies into browser context
+            cookies = solve_result.get("cookies", [])
+            cookie_names = []
+            if cookies:
+                context = page.context
+                context.add_cookies(cookies)
+                cookie_names = [c["name"] for c in cookies]
+                logger.info("Injected %d FlareSolverr cookies: %s",
+                            len(cookies), cookie_names)
+
+            # Step 3: Extract domain
+            domain = urlparse(target_url).netloc
+            if not domain:
+                return {"status": "error", "url": target_url,
+                        "error": "Could not extract domain from URL"}
+
+            # Step 4: Set up persistent route interception
+            # Only proxy main document requests — subresources (CSS/JS/images)
+            # load directly since CF typically only challenges the first page load.
+            def _proxy_route(route):
+                # Only intercept document-level requests (navigations, not subresources)
+                if route.request.resource_type not in ("document", "xhr", "fetch"):
+                    route.continue_()
+                    return
+
+                req_url = route.request.url
+                try:
+                    result = fetch_raw_via_flaresolverr(
+                        req_url, max_timeout=30000,
+                        flaresolverr_url="http://localhost:8191/v1",
+                        proxy=proxy,
+                    )
+                    if result.get("status") == "ok":
+                        route.fulfill(
+                            status=result.get("status_code", 200),
+                            headers=result.get("headers",
+                                {"content-type": "text/html; charset=utf-8"}),
+                            body=result.get("body", b""),
+                        )
+                        return
+                except Exception as e:
+                    logger.warning("FlareSolverr route proxy error: %s", e)
+                try:
+                    route.continue_()
+                except Exception:
+                    pass
+
+            route_re = _re.compile(rf"https?://{_re.escape(domain)}/.*")
+            page.route(route_re, _proxy_route)
+            page.route(f"**/*{domain}**", _proxy_route)
+            logger.info("FlareSolverr route interception ACTIVE for: %s", domain)
+
+            return {
+                "status": "ok",
+                "url": solve_result.get("url", target_url),
+                "domain": domain,
+                "routes_active": True,
+                "cookies_injected": len(cookie_names),
+                "cookie_names": cookie_names,
+                "cf_clearance": solve_result.get("cf_clearance"),
+                "next_step": (
+                    "Route interception ACTIVE. Call camoufox_navigate() — "
+                    "ALL requests to this domain proxy through FlareSolverr's "
+                    "Chromium, bypassing Cloudflare transparently. All subsequent "
+                    "navigation, clicks, and snapshots on this domain work normally."
+                ),
+            }
+
+        return await loop.run_in_executor(_executor, _solve_and_setup_proxy)
 
     # --- Ref-based interaction ---
 

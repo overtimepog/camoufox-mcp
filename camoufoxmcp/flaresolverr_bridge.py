@@ -276,6 +276,96 @@ def check_flaresolverr_health(
         }
 
 
+def fetch_raw_via_flaresolverr(
+    url: str,
+    max_timeout: int = 60000,
+    flaresolverr_url: str = DEFAULT_FLARESOLVERR_URL,
+    proxy: str | None = None,
+) -> dict[str, Any]:
+    """Fetch a URL through FlareSolverr, returning raw bytes for route fulfillment.
+
+    Same heavy-artillery CF bypass as fetch_via_flaresolverr, but returns
+    the raw response body (bytes) and headers — designed for Playwright
+    route interception where the browser needs the exact HTTP response.
+
+    Args:
+        url: Target URL.
+        max_timeout: Max solve time in ms.
+        flaresolverr_url: FlareSolverr endpoint.
+        proxy: Optional proxy URL.
+
+    Returns:
+        {"status": "ok"|"cf_blocked"|"error", "body": b"...", "headers": {...},
+         "status_code": 200, "elapsed_ms": ...}
+    """
+    t0 = time.time()
+
+    ensure = ensure_flaresolverr_running()
+    if ensure["status"] not in ("ready", "already_running", "started"):
+        return {
+            "status": "error",
+            "url": url,
+            "error": f"FlareSolverr not available: {ensure.get('error', ensure.get('status'))}",
+            "elapsed_ms": int((time.time() - t0) * 1000),
+        }
+
+    payload: dict[str, Any] = {
+        "cmd": "request.get",
+        "url": url,
+        "maxTimeout": max_timeout,
+    }
+    if proxy:
+        payload["proxy"] = {"url": proxy}
+
+    try:
+        result = _call_flaresolverr(payload, flaresolverr_url)
+    except FlareSolverrNotRunning:
+        return {
+            "status": "error", "url": url,
+            "error": "FlareSolverr not running",
+            "elapsed_ms": int((time.time() - t0) * 1000),
+        }
+    except Exception as e:
+        return {
+            "status": "error", "url": url,
+            "error": f"{type(e).__name__}: {e}",
+            "elapsed_ms": int((time.time() - t0) * 1000),
+        }
+
+    elapsed_ms = int((time.time() - t0) * 1000)
+
+    if result.get("status") != "ok":
+        return {
+            "status": "error", "url": url,
+            "error": result.get("message", "FlareSolverr returned error"),
+            "elapsed_ms": elapsed_ms,
+        }
+
+    solution = result.get("solution", {})
+    response_html = solution.get("response", "")
+
+    if _is_cf_challenge_html(response_html):
+        return {
+            "status": "cf_blocked", "url": solution.get("url", url),
+            "error": "FlareSolverr could not solve the Cloudflare challenge.",
+            "elapsed_ms": elapsed_ms,
+        }
+
+    # Extract content-type from response headers
+    headers = solution.get("headers", {})
+    if not headers:
+        headers = {"content-type": "text/html; charset=utf-8"}
+
+    return {
+        "status": "ok",
+        "url": solution.get("url", url),
+        "status_code": solution.get("status", 200),
+        "body": response_html.encode("utf-8"),
+        "headers": headers,
+        "elapsed_ms": elapsed_ms,
+    }
+
+
 def fetch_via_flaresolverr(
     url: str,
     max_length: int = 50000,
@@ -383,12 +473,219 @@ def fetch_via_flaresolverr(
             break
 
     content_text = _html_to_text(response_html, max_length)
+    links = _extract_links(response_html, solution.get("url", url))
 
     return {
         "status": "ok",
         "url": solution.get("url", url),
         "status_code": solution.get("status", 200),
         "content": content_text,
+        "links": links,
+        "cookies": cookies,
+        "cf_clearance": cf_clearance,
+        "elapsed_ms": elapsed_ms,
+        "solver": "flaresolverr (headless Chromium + puppeteer-extra)",
+    }
+
+
+def _extract_links(html_content: str, base_url: str = "") -> list[dict[str, str]]:
+    """Extract all <a href> links from HTML, returning structured link data.
+    
+    Filters out navigation, anchors, javascript:, and common noise patterns.
+    Returns relative URLs resolved against base_url when provided.
+    """
+    from urllib.parse import urljoin
+    
+    links: list[dict[str, str]] = []
+    seen: set[str] = set()
+    
+    # Match <a> tags with href
+    for m in re.finditer(
+        r'<a[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
+        html_content,
+        re.IGNORECASE | re.DOTALL,
+    ):
+        href = m.group(1).strip()
+        text = re.sub(r"<[^>]+>", "", m.group(2)).strip()
+        
+        # Skip noise
+        if not href or href.startswith(("#", "javascript:", "mailto:", "tel:")):
+            continue
+        if not text:
+            continue
+        if len(text) > 300:  # likely not a real link text
+            continue
+        
+        # Resolve relative URLs
+        full_url = urljoin(base_url, href) if base_url else href
+        
+        # Dedupe
+        if full_url in seen:
+            continue
+        seen.add(full_url)
+        
+        # Classify link type
+        link_type = "page"
+        if any(full_url.lower().endswith(ext) for ext in (
+            ".pdf", ".zip", ".7z", ".rar", ".tar.gz", ".gz", ".exe", ".dll",
+            ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+            ".png", ".jpg", ".jpeg", ".gif", ".svg", ".mp4", ".mp3",
+            ".json", ".xml", ".csv", ".txt", ".md", ".py", ".js", ".html",
+            ".bin", ".pcap", ".pcapng", ".log", ".elf", ".dmp",
+        )):
+            link_type = "file"
+        elif "/" in full_url and not full_url.endswith("/"):
+            pass  # keep as "page"
+
+        links.append({
+            "text": text,
+            "url": full_url,
+            "type": link_type,
+        })
+
+    # Also extract Phoenix LiveView navigation targets (phx-click="change-directory")
+    for m in re.finditer(
+        r'phx-click="([^"]+)"',
+        html_content,
+        re.IGNORECASE,
+    ):
+        attr_value = m.group(1)
+        # Unescape HTML entities
+        attr_value = attr_value.replace("&quot;", '"').replace("&amp;", "&")
+        # Extract path value from the JSON-like structure
+        val_match = re.search(r'"value"\s*:\s*"([^"]+)"', attr_value)
+        evt_match = re.search(r'"event"\s*:\s*"([^"]+)"', attr_value)
+        if val_match and evt_match and evt_match.group(1) == "change-directory":
+            path_value = val_match.group(1)
+            full_url = urljoin(base_url, "/" + path_value) if base_url else "/" + path_value
+            if full_url not in seen:
+                seen.add(full_url)
+                text = path_value.rstrip("/").rsplit("/", 1)[-1] if "/" in path_value else path_value
+                links.append({
+                    "text": text,
+                    "url": full_url,
+                    "type": "page",
+                })
+
+    return links
+
+
+def solve_via_flaresolverr(
+    url: str,
+    max_timeout: int = 60000,
+    flaresolverr_url: str = DEFAULT_FLARESOLVERR_URL,
+    proxy: str | None = None,
+) -> dict[str, Any]:
+    """Solve Cloudflare challenge via FlareSolverr, returning clearance cookies.
+
+    Uses FlareSolverr's headless Chromium to solve the CF challenge and
+    returns the resulting cookies for injection into a browser context.
+    This is the heavy-artillery equivalent of cloudscraper's solve_and_inject
+    — use when cloudscraper's HTTP-level solver fails (cf_blocked status).
+
+    Args:
+        url: Target URL behind Cloudflare.
+        max_timeout: Max solve time in ms (default: 60000).
+        flaresolverr_url: FlareSolverr endpoint.
+        proxy: Optional proxy URL for FlareSolverr's browser.
+
+    Returns:
+        {
+            "status": "ok" | "cf_blocked" | "error",
+            "url": final URL,
+            "cookies": [{name, value, domain, path, ...}],
+            "cf_clearance": "..." or None,
+            "elapsed_ms": round-trip time,
+        }
+    """
+    t0 = time.time()
+
+    # Auto-start FlareSolverr if not running
+    ensure = ensure_flaresolverr_running()
+    if ensure["status"] not in ("ready", "already_running", "started"):
+        return {
+            "status": "error",
+            "url": url,
+            "error": f"FlareSolverr not available: {ensure.get('error', ensure.get('status'))}",
+            "hint": ensure.get("hint", "Ensure Docker is running and try again"),
+            "elapsed_ms": int((time.time() - t0) * 1000),
+        }
+
+    payload: dict[str, Any] = {
+        "cmd": "request.get",
+        "url": url,
+        "maxTimeout": max_timeout,
+    }
+    if proxy:
+        payload["proxy"] = {"url": proxy}
+
+    try:
+        result = _call_flaresolverr(payload, flaresolverr_url)
+    except FlareSolverrNotRunning:
+        return {
+            "status": "error",
+            "url": url,
+            "error": "FlareSolverr not running",
+            "hint": "docker run -d --restart unless-stopped -p 8191:8191 flaresolverr/flaresolverr:latest",
+            "elapsed_ms": int((time.time() - t0) * 1000),
+        }
+    except Exception as e:
+        logger.exception("FlareSolverr solve failed for %s", url)
+        return {
+            "status": "error",
+            "url": url,
+            "error": f"{type(e).__name__}: {e}",
+            "elapsed_ms": int((time.time() - t0) * 1000),
+        }
+
+    elapsed_ms = int((time.time() - t0) * 1000)
+
+    if result.get("status") != "ok":
+        return {
+            "status": "error",
+            "url": url,
+            "error": result.get("message", "FlareSolverr returned error"),
+            "elapsed_ms": elapsed_ms,
+        }
+
+    solution = result.get("solution", {})
+    response_html = solution.get("response", "")
+
+    # Detect unsolved challenge
+    if _is_cf_challenge_html(response_html):
+        return {
+            "status": "cf_blocked",
+            "url": solution.get("url", url),
+            "error": (
+                "FlareSolverr could not solve the Cloudflare challenge. "
+                "The site may be using protection beyond current capabilities."
+            ),
+            "elapsed_ms": elapsed_ms,
+        }
+
+    # Extract and normalize cookies for browser injection
+    raw_cookies = solution.get("cookies", [])
+    cookies: list[dict[str, Any]] = []
+    cf_clearance = None
+    for c in raw_cookies:
+        cookie = {
+            "name": c.get("name", ""),
+            "value": c.get("value", ""),
+            "domain": c.get("domain", ""),
+            "path": c.get("path", "/"),
+            "secure": c.get("secure", False),
+            "httpOnly": c.get("httpOnly", False),
+        }
+        if c.get("expiry"):
+            cookie["expires"] = c["expiry"]
+        cookies.append(cookie)
+
+        if c.get("name") == "cf_clearance":
+            cf_clearance = c.get("value")
+
+    return {
+        "status": "ok",
+        "url": solution.get("url", url),
         "cookies": cookies,
         "cf_clearance": cf_clearance,
         "elapsed_ms": elapsed_ms,
