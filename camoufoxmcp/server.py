@@ -1,6 +1,6 @@
 """CamoufoxMCP server — stealth browser automation for AI agents.
 
-~21 tools. Snapshot-first. Three-tier Cloudflare bypass with auto-managed FlareSolverr.
+~21 tools. Snapshot-first. Two-tier Cloudflare bypass (cloudscraper + FlareSolverr).
 """
 
 from __future__ import annotations
@@ -127,22 +127,21 @@ def create_server(caps: set[str] | None = None):
             "5. camoufox_read_page(page_id) — page as clean markdown\n"
             "6. camoufox_screenshot(page_id) — screenshot\n"
             "7. camoufox_close() — done\n\n"
-            "CLOUDFLARE BYPASS (three tiers, escalate as needed):\n"
-            "Tier 1 (fast, no deps): camoufox_cloudscraper_fetch(url)\n"
+            "CLOUDFLARE BYPASS (two tiers, escalate as needed):\n"
+            "Tier 1 (fast, no Docker): camoufox_cloudscraper_fetch(url)\n"
             "  HTTP-level JS solver. Handles IUAM, v1, v2. ~100-500ms.\n"
-            "Tier 2 (browser-level): camoufox_cloudscraper_solve(page_id)\n"
-            "  Solves CF + injects cookies into Camoufox browser context.\n"
-            "Tier 3 (heavy artillery): camoufox_flaresolverr_fetch(url)\n"
+            "  Also: camoufox_cloudscraper_solve(page_id) to inject\n"
+            "  cookies into active browser context.\n"
+            "Tier 2 (heavy artillery): camoufox_flaresolverr_fetch(url)\n"
             "  Docker-based headless Chromium. Solves Turnstile, JS VM v3,\n"
-            "  managed challenges — bypasses EVERYTHING. ~1-10s.\n"
-            "  Requires: docker run -d -p 8191:8191 flaresolverr/flaresolverr\n\n"
+            "  managed challenges — bypasses EVERYTHING. ~1-15s.\n"
+            "  Auto-starts Docker container on first use.\n\n"
             "WHEN BROWSER IS BLOCKED (camoufox_navigate → cloudflare_blocked=true):\n"
-            "  1. Try camoufox_cloudscraper_solve(page_id) → re-navigate\n"
-            "  2. If that fails, camoufox_cloudscraper_fetch(url) for direct content\n"
-            "  3. If still blocked, camoufox_flaresolverr_fetch(url) for guaranteed bypass\n\n"
+            "  1. camoufox_cloudscraper_fetch(url) — fast HTTP bypass\n"
+            "  2. If blocked, camoufox_flaresolverr_fetch(url) — guaranteed bypass\n\n"
             "KEY DIFFERENCE from CloakBrowser:\n"
-            "Camoufox is Firefox-based Playwright with three-tier Cloudflare bypass —\n"
-            "cloudscraper (fast HTTP), cookie injection (browser), FlareSolverr (guaranteed)."
+            "Camoufox is Firefox-based Playwright with two-tier Cloudflare bypass —\n"
+            "cloudscraper (fast HTTP) → FlareSolverr (Docker Chromium, guaranteed)."
         ),
     )
 
