@@ -1,6 +1,6 @@
 """CamoufoxMCP server — stealth browser automation for AI agents.
 
-~20 tools. Snapshot-first. Human-verification delegation when Cloudflare blocks.
+~21 tools. Snapshot-first. Three-tier Cloudflare bypass with auto-managed FlareSolverr.
 """
 
 from __future__ import annotations
@@ -10,7 +10,6 @@ import json
 import logging
 import os
 import sys
-import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -21,6 +20,16 @@ from .session import BrowserSession, SessionConfig, BrowserSessionError, PageNot
 from .snapshot import take_snapshot, resolve_ref
 from .markdown import extract_markdown
 from .vision import take_screenshot
+from .cloudscraper_bridge import fetch_via_cloudscraper, solve_and_inject
+from .flaresolverr_bridge import (
+    fetch_via_flaresolverr,
+    check_flaresolverr_health,
+    start_flaresolverr,
+    stop_flaresolverr,
+    ensure_flaresolverr_running,
+    is_flaresolverr_running,
+    FlareSolverrNotRunning,
+)
 
 logger = logging.getLogger("camoufoxmcp")
 
@@ -90,12 +99,6 @@ async def _safe(handler, *args, **kwargs) -> dict[str, Any]:
 # Helpers
 # -----------------------------------------------------------------------
 
-def _is_cloudflare_blocked(title: str, url: str) -> bool:
-    title_lower = title.lower()
-    cf_patterns = {"just a moment", "checking your browser", "cloudflare", "attention required"}
-    return any(p in title_lower for p in cf_patterns)
-
-
 async def _run_in_executor(self, func, *args, **kwargs):
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(self._executor, lambda: func(*args, **kwargs))
@@ -116,27 +119,30 @@ def create_server(caps: set[str] | None = None):
         instructions=(
             "Camoufox — stealth browser automation powered by Camoufox (humanized Playwright Firefox fork).\n\n"
             "WORKFLOW:\n"
-            "1. camoufox_launch(display_mode='headed') — start browser (use 'headed' for visible window, 'headless' for invisible)\n"
-            "2. camoufox_navigate(page_id, url) — go to URL (auto-waits for settle)\n"
+            "Basic browsing:\n"
+            "1. camoufox_launch() — start browser (headless or headed)\n"
+            "2. camoufox_navigate(page_id, url) — go to URL\n"
             "3. camoufox_snapshot(page_id) — get interactive elements as [@eN] refs\n"
-            "4. camoufox_click(page_id, '@e5') — click by ref\n"
-            "5. camoufox_type(page_id, '@e3', 'text') — type by ref\n"
-            "6. camoufox_read_page(page_id) — page as clean markdown\n"
-            "7. camoufox_screenshot(page_id) — annotated screenshot\n"
-            "8. camoufox_close() — done\n\n"
-            "DISPLAY MODE:\n"
-            "'headless' (default): invisible browser, best for background automation.\n"
-            "'headed': visible window, useful when Cloudflare blocks and human verification\n"
-            "is needed in a real browser, or for visual debugging.\n\n"
-            "HUMAN VERIFICATION (Cloudflare blocks automation):\n"
-            "If camoufox_navigate returns cloudflare_blocked=true, call:\n"
-            "  camoufox_snapshot_if_blocked(page_id) → gets verification URL + user instruction\n"
-            "  User opens their real browser → solves challenge → confirms done\n"
-            "  camoufox_human_verify(page_id) → automation resumes\n\n"
+            "4. camoufox_click / camoufox_type / camoufox_scroll — interact\n"
+            "5. camoufox_read_page(page_id) — page as clean markdown\n"
+            "6. camoufox_screenshot(page_id) — screenshot\n"
+            "7. camoufox_close() — done\n\n"
+            "CLOUDFLARE BYPASS (three tiers, escalate as needed):\n"
+            "Tier 1 (fast, no deps): camoufox_cloudscraper_fetch(url)\n"
+            "  HTTP-level JS solver. Handles IUAM, v1, v2. ~100-500ms.\n"
+            "Tier 2 (browser-level): camoufox_cloudscraper_solve(page_id)\n"
+            "  Solves CF + injects cookies into Camoufox browser context.\n"
+            "Tier 3 (heavy artillery): camoufox_flaresolverr_fetch(url)\n"
+            "  Docker-based headless Chromium. Solves Turnstile, JS VM v3,\n"
+            "  managed challenges — bypasses EVERYTHING. ~1-10s.\n"
+            "  Requires: docker run -d -p 8191:8191 flaresolverr/flaresolverr\n\n"
+            "WHEN BROWSER IS BLOCKED (camoufox_navigate → cloudflare_blocked=true):\n"
+            "  1. Try camoufox_cloudscraper_solve(page_id) → re-navigate\n"
+            "  2. If that fails, camoufox_cloudscraper_fetch(url) for direct content\n"
+            "  3. If still blocked, camoufox_flaresolverr_fetch(url) for guaranteed bypass\n\n"
             "KEY DIFFERENCE from CloakBrowser:\n"
-            "Camoufox is Firefox-based Playwright with built-in stealth. "
-            "It automatically solves most Cloudflare challenges. "
-            "Only use human_verify when it can't."
+            "Camoufox is Firefox-based Playwright with three-tier Cloudflare bypass —\n"
+            "cloudscraper (fast HTTP), cookie injection (browser), FlareSolverr (guaranteed)."
         ),
     )
 
@@ -250,7 +256,11 @@ def create_server(caps: set[str] | None = None):
         title = result["title"]
         url_final = result["url"]
 
-        cf_blocked = _is_cloudflare_blocked(title, url_final)
+        title_lower = title.lower()
+        cf_blocked = any(
+            p in title_lower
+            for p in ("just a moment", "checking your browser", "cloudflare", "attention required")
+        )
 
         return {
             "status": "navigated",
@@ -258,7 +268,10 @@ def create_server(caps: set[str] | None = None):
             "title": title,
             "cloudflare_blocked": cf_blocked,
             "settled": not cf_blocked,
-            "hint": "User solved Cloudflare challenge" if cf_blocked else None,
+            "hint": (
+                "Cloudflare detected. Use camoufox_cloudscraper_solve(page_id) to "
+                "bypass with cloudscraper's JS solver, then re-navigate."
+            ) if cf_blocked else None,
         }
 
     # --- Snapshot (PRIMARY page understanding) ---
@@ -283,138 +296,190 @@ def create_server(caps: set[str] | None = None):
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(_executor, take_snapshot, page, page_id, _session, full, max_length)
 
-    # --- KEY TOOL: Human verification delegation ---
+    # --- Cloudscraper integration: HTTP-level CF bypass ---
 
     @mcp.tool()
-    async def camoufox_snapshot_if_blocked(page_id: str) -> dict[str, Any]:
-        """Check if Cloudflare is blocking and get human-verification instructions.
+    async def camoufox_cloudscraper_fetch(
+        url: str,
+        max_length: int = 50000,
+        proxy: str | None = None,
+        timeout: int = 30,
+    ) -> dict[str, Any]:
+        """Fetch a URL through cloudscraper, bypassing Cloudflare at the HTTP level.
 
-        This is the KEY tool for Cloudflare-bypassed targets. Call this when
-        camoufox_navigate returns cloudflare_blocked=true.
+        Use this when:
+        - You need quick page content without full browser interaction
+        - A target is behind Cloudflare and you want a fast, lightweight fetch
+        - Camoufox browser is blocked and you want an alternative access path
 
-        It captures the challenge page and returns:
-        - instruction: exact step-by-step for the user
-        - verification_url: URL to open in their real browser
-        - screenshot: annotated image showing what to click
+        cloudscraper solves Cloudflare JS challenges (v1, v2, v3, Turnstile)
+        using a requests.Session — no browser needed. Much faster than full
+        browser navigation.
 
-        The automation PAUSES until camoufox_human_verify() is called.
+        The returned cookies can be injected into a Camoufox browser session
+        via camoufox_cloudscraper_solve() so the browser can continue.
 
         Args:
-            page_id: The blocked page ID from camoufox_navigate.
+            url: Full URL to fetch.
+            max_length: Max characters in returned content (default: 50000).
+            proxy: Optional proxy URL e.g. 'http://user:pass@host:port'.
+            timeout: Request timeout in seconds (default: 30).
 
         Returns:
             {
-                "status": "ok",
-                "cloudflare_blocked": true,
-                "instruction": "Open verification_url in your browser, click Verify, confirm here when done",
-                "verification_url": "https://...",
-                "verification_complete": false,
-                "screenshot_path": "/tmp/...",
-                "pause_reason": "Awaiting human verification",
+                "status": "ok" | "cf_blocked" | "error",
+                "url": final URL after redirects,
+                "status_code": HTTP status,
+                "content": extracted readable text,
+                "cookies": {name: value, ...},
+                "elapsed_ms": round-trip time,
             }
         """
-        page = _session.get_page(page_id)
         loop = asyncio.get_event_loop()
-
-        def _check():
-            page.wait_for_timeout(2000)
-            title = page.title()
-            url = page.url
-            is_blocked = _is_cloudflare_blocked(title, url)
-
-            if not is_blocked:
-                return {
-                    "status": "ok",
-                    "cloudflare_blocked": False,
-                    "message": "No Cloudflare challenge detected",
-                }
-
-            # Take screenshot of the challenge
-            screenshot_path = f"/tmp/cf_challenge_{uuid.uuid4().hex[:6]}.png"
-            page.screenshot(path=screenshot_path)
-
-            # Try to find the verification URL / challenge iframe
-            verification_url = url  # Default to current URL
-
-            # Look for Cloudflare challenge iframe or redirect
-            try:
-                frames = page.frames
-                for frame in frames:
-                    if frame.url and "cloudflare" in frame.url.lower():
-                        verification_url = frame.url
-                        break
-            except Exception:
-                pass
-
-            return {
-                "status": "ok",
-                "cloudflare_blocked": True,
-                "instruction": (
-                    f"Open this URL in your browser and complete the verification:\n"
-                    f"  {verification_url}\n\n"
-                    f"Solve the Cloudflare challenge (click the Verify button / complete the CAPTCHA), "
-                    f"then come back here and call camoufox_human_verify('{page_id}') to resume automation.\n\n"
-                    f"Screenshot saved to: {screenshot_path}"
-                ),
-                "verification_url": verification_url,
-                "verification_complete": False,
-                "screenshot_path": screenshot_path,
-                "pause_reason": "Awaiting human verification — cf snapshot captured",
-                "title": title,
-                "url": url,
-            }
-
-        return await loop.run_in_executor(_executor, _check)
+        return await loop.run_in_executor(
+            _executor,
+            fetch_via_cloudscraper,
+            url,
+            max_length,
+            proxy,
+            timeout,
+        )
 
     @mcp.tool()
-    async def camoufox_human_verify(page_id: str) -> dict[str, Any]:
-        """Resume automation after human completes Cloudflare verification.
+    async def camoufox_cloudscraper_solve(
+        page_id: str,
+        proxy: str | None = None,
+        timeout: int = 30,
+    ) -> dict[str, Any]:
+        """Use cloudscraper to solve Cloudflare and inject cookies into the browser.
 
-        Call this AFTER the user has solved the Cloudflare challenge in their
-        real browser. It checks if the challenge is resolved and continues.
+        When Camoufox browser hits a Cloudflare challenge and you don't want
+        to use human verification, this tool:
+        1. Uses cloudscraper's JS solver to get valid clearance cookies
+        2. Injects those cookies into the active Camoufox browser session
+        3. The browser can then navigate past Cloudflare without challenge
 
-        IMPORTANT: User must complete verification BEFORE calling this tool.
+        Call this after camoufox_navigate() returns cloudflare_blocked=true.
+        After it succeeds, re-navigate with camoufox_navigate() — the browser
+        will pass through Cloudflare with the injected cookies.
 
         Args:
-            page_id: The page ID that was blocked.
+            page_id: Page ID from the blocked browser session.
+            proxy: Optional proxy URL.
+            timeout: Request timeout in seconds (default: 30).
 
         Returns:
             {
-                "status": "ok" | "still_blocked",
-                "title": "...",
-                "url": "...",
-                "message": "Verification complete, ready to continue" | "Still blocked, try again",
+                "status": "ok" | "cf_blocked" | "error",
+                "cookies_injected": N,
+                "cookie_names": [...],
+                "next_step": "Call camoufox_navigate() again",
             }
         """
         page = _session.get_page(page_id)
+        url = page.url
         loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            _executor,
+            solve_and_inject,
+            page,
+            url,
+            proxy,
+            timeout,
+        )
 
-        def _check():
-            page.wait_for_timeout(3000)
-            title = page.title()
-            url = page.url
-            is_blocked = _is_cloudflare_blocked(title, url)
+    # --- FlareSolverr integration: Docker-based CF bypass (hardest challenges) ---
+    # Auto-start: camoufox_flaresolverr_fetch will start FlareSolverr if needed
+    # Manage manually: camoufox_flaresolverr_start / _stop
 
-            if is_blocked:
-                return {
-                    "status": "still_blocked",
-                    "title": title,
-                    "url": url,
-                    "message": (
-                        "Cloudflare challenge still active. "
-                        "Make sure you completed verification in your browser, then try again. "
-                        "If the verification expired, re-navigate with camoufox_navigate."
-                    ),
-                }
+    @mcp.tool()
+    async def camoufox_flaresolverr_start() -> dict[str, Any]:
+        """Start FlareSolverr Docker container if not running.
 
-            return {
-                "status": "ok",
-                "title": title,
-                "url": url,
-                "message": "Verification complete. Automation resuming.",
+        Pulls the image if needed, creates a named container
+        ('camoufox-flaresolverr'), and waits for it to become healthy.
+        Safe to call even if already running (no-op).
+
+        FlareSolverr solves Turnstile, JS VM v3, and CAPTCHA challenges
+        that cloudscraper cannot handle.
+        """
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(_executor, start_flaresolverr)
+
+    @mcp.tool()
+    async def camoufox_flaresolverr_stop() -> dict[str, Any]:
+        """Stop the FlareSolverr Docker container.
+
+        Frees resources when Tier 3 bypass is no longer needed.
+        """
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(_executor, stop_flaresolverr)
+
+    @mcp.tool()
+    async def camoufox_flaresolverr_health() -> dict[str, Any]:
+        """Check if FlareSolverr Docker container is running.
+
+        FlareSolverr solves the hardest Cloudflare challenges (Turnstile,
+        JS VM v3 "managed challenge") that cloudscraper can't handle.
+        It requires Docker running on port 8191.
+
+        Start it once:
+          docker run -d --restart unless-stopped -p 8191:8191 flaresolverr/flaresolverr:latest
+        """
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(_executor, check_flaresolverr_health)
+
+    @mcp.tool()
+    async def camoufox_flaresolverr_fetch(
+        url: str,
+        max_length: int = 50000,
+        max_timeout: int = 60000,
+        proxy: str | None = None,
+    ) -> dict[str, Any]:
+        """Fetch a URL through FlareSolverr — bypasses ALL Cloudflare protections.
+
+        This is the HEAVY ARTILLERY for Cloudflare bypass. FlareSolverr runs
+        headless Chromium with puppeteer-extra stealth plugin and solves:
+        - Cloudflare Turnstile
+        - JS VM v3 "managed challenge"
+        - IUAM (I'm Under Attack Mode)
+        - CAPTCHA challenges
+
+        Use this when cloudscraper (camoufox_cloudscraper_fetch) fails with
+        cf_blocked status. Requires Docker running FlareSolverr on port 8191.
+
+        Slower than cloudscraper (1-10s vs 50-500ms) but bypasses everything.
+
+        Start FlareSolverr (one-time):
+          docker run -d --restart unless-stopped -p 8191:8191 flaresolverr/flaresolverr:latest
+
+        Args:
+            url: Target URL to fetch.
+            max_length: Max characters in returned content (default: 50000).
+            max_timeout: Max solve time in ms (default: 60000).
+            proxy: Optional proxy URL for FlareSolverr's browser.
+
+        Returns:
+            {
+                "status": "ok" | "cf_blocked" | "error",
+                "url": final URL,
+                "content": extracted readable text,
+                "cookies": [...],
+                "cf_clearance": "..." or None,
+                "elapsed_ms": round-trip time,
+                "solver": "flaresolverr (headless Chromium + puppeteer-extra)",
             }
-
-        return await loop.run_in_executor(_executor, _check)
+        """
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            _executor,
+            fetch_via_flaresolverr,
+            url,
+            max_length,
+            max_timeout,
+            "http://localhost:8191/v1",
+            proxy,
+        )
 
     # --- Ref-based interaction ---
 

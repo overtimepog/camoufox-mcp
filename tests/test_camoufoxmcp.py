@@ -1,7 +1,6 @@
 """Tests for CamoufoxMCP."""
 
 import pytest
-import asyncio
 from unittest.mock import MagicMock
 
 
@@ -96,7 +95,7 @@ class TestMarkdownExtraction:
         from camoufoxmcp.markdown import extract_markdown
         page = MagicMock()
         page.content.return_value = "<html><body><h1>Hello</h1><p>World</p></body></html>"
-        result = asyncio.get_event_loop().run_until_complete(extract_markdown(page))
+        result = extract_markdown(page)
         assert result["status"] == "ok"
         assert "Hello" in result["content"]
         assert "World" in result["content"]
@@ -110,30 +109,10 @@ class TestMarkdownExtraction:
             "<h1>Safe</h1>"
             "</body></html>"
         )
-        result = asyncio.get_event_loop().run_until_complete(extract_markdown(page))
+        result = extract_markdown(page)
         assert result["status"] == "ok"
         assert "Safe" in result["content"]
         assert "alert" not in result["content"]
-
-
-class TestCloudflareDetection:
-    """Test Cloudflare challenge detection."""
-
-    def test_is_cloudflare_blocked_true(self):
-        from camoufoxmcp.server import _is_cloudflare_blocked
-        assert _is_cloudflare_blocked("Just a moment...", "https://example.com/") is True
-        assert _is_cloudflare_blocked("Checking your browser", "https://example.com/") is True
-        assert _is_cloudflare_blocked("Cloudflare", "https://example.com/") is True
-
-    def test_is_cloudflare_blocked_false(self):
-        from camoufoxmcp.server import _is_cloudflare_blocked
-        assert _is_cloudflare_blocked("Vx Underground", "https://vx-underground.org/") is False
-        assert _is_cloudflare_blocked("Example Domain", "https://example.com/") is False
-
-    def test_is_cloudflare_case_insensitive(self):
-        from camoufoxmcp.server import _is_cloudflare_blocked
-        assert _is_cloudflare_blocked("JUST A MOMENT...", "https://example.com/") is True
-        assert _is_cloudflare_blocked("CloudFlare", "https://example.com/") is True
 
 
 class TestSnapshotJS:

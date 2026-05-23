@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "camoufox-mcp"
-version = "0.1.0"
+version = "0.3.1"
 description = "Camoufox MCP server — stealth Playwright browser automation for AI agents, with Cloudflare bypass and human-verification delegation"
 readme = "README.md"
 license = "Apache-2.0"
@@ -44,6 +44,7 @@ classifiers = [
 dependencies = [
     "mcp>=1.20,<2.0",
     "camoufox>=0.4.0",
+    "cloudscraper>=1.2.0",
 ]
 
 [project.optional-dependencies]
