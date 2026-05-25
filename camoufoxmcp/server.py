@@ -254,6 +254,27 @@ def create_server(caps: set[str] | None = None):
         await _session.close()
         return {"status": "closed"}
 
+    @mcp.tool()
+    async def camoufox_resize_viewport(
+        width: int = 0,
+        height: int = 0,
+    ) -> dict[str, Any]:
+        """Resize the browser viewport to specific dimensions or auto-fit the screen.
+
+        Use this in headed mode to make the browser window fit the user's actual
+        display. Pass width=0, height=0 to auto-detect the screen size on macOS.
+
+        New pages created after this call inherit the resized viewport.
+
+        Args:
+            width: Desired width in pixels (0 = auto-detect from screen).
+            height: Desired height in pixels (0 = auto-detect from screen).
+        """
+        if not _session.is_running:
+            return _err("Browser not running. Call camoufox_launch() first.")
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(_executor, lambda: _session.resize_viewport_sync(width, height))
+
     # ==================================================================
     # Page / tab management
     # ==================================================================

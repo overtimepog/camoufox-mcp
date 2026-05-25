@@ -27,6 +27,45 @@ def _random_viewport(seed: int | None = None) -> dict[str, int]:
     return {"width": w, "height": h}
 
 
+def _detect_screen_size() -> tuple[int, int]:
+    """Detect the primary display resolution on the host machine.
+
+    macOS: uses system_profiler or returns a sensible Retina-aware default.
+    Falls back to 1440x875 (half a 1440p display, accounting for menu bar + dock).
+    """
+    import platform
+    if platform.system() == "Darwin":
+        try:
+            import subprocess
+            r = subprocess.run(
+                ["system_profiler", "SPDisplaysDataType"],
+                capture_output=True, text=True, timeout=5,
+            )
+            # Parse "Resolution: 2560 x 1664" or similar
+            for line in r.stdout.splitlines():
+                if "Resolution:" in line:
+                    parts = line.split(":")[-1].strip().split("x")
+                    if len(parts) == 2:
+                        w_raw = parts[0].strip().replace(" ", "")
+                        h_raw = parts[1].strip().replace(" ", "")
+                        try:
+                            w = int(w_raw)
+                            h = int(h_raw)
+                            # On Retina displays, system_profiler reports the scaled resolution.
+                            # Use ~90% of height to leave room for menu bar + dock.
+                            usable_h = int(h * 0.85)
+                            return w, usable_h
+                        except ValueError:
+                            pass
+        except Exception:
+            pass
+        # Fallback: common MacBook Pro 14" / 16" scaled res
+        return 1512, 840
+
+    # Linux/Windows fallback
+    return 1440, 875
+
+
 class BrowserSessionError(RuntimeError):
     """Raised when the browser session is in an invalid state."""
 
@@ -75,6 +114,7 @@ class BrowserSession:
         self._active_page_id: str | None = None
         self._executor: ThreadPoolExecutor | None = None
         self._display_mode: str = "headless"
+        self._current_viewport: dict[str, int] | None = None  # tracked so new pages inherit it
 
         # Per-page dialog and console stores (populated by page event handlers)
         self._dialogs: dict[str, list[dict[str, Any]]] = {}
@@ -194,7 +234,8 @@ class BrowserSession:
         self._active_page_id = None
         self._dialogs = {}
         self._console = {}
-        logger.info("Camoufox browser launched (headless=%s)", cfg.headless)
+        self._current_viewport = dict(cfg.viewport) if cfg.viewport else None
+        logger.info("Camoufox browser launched (headless=%s, viewport=%s)", cfg.headless, self._current_viewport)
 
     async def new_page(self) -> str:
         """Create a new page in the existing context. Sets it as active."""
@@ -218,8 +259,68 @@ class BrowserSession:
         self._pages[page_id] = page
         self._page_ids.append(page_id)
         self._active_page_id = page_id
+
+        # Inherit viewport from session if one was set (post-launch resize)
+        if self._current_viewport:
+            def _apply_vp():
+                try:
+                    page.set_viewport_size(self._current_viewport)
+                except Exception:
+                    pass
+            loop.run_in_executor(self._executor, _apply_vp)
+
         logger.debug("New page %s (total: %d)", page_id, len(self._pages))
         return page_id
+
+    async def resize_viewport(self, width: int, height: int) -> dict[str, Any]:
+        """Resize the viewport on all open pages and store for future pages.
+
+        On macOS, auto-detect can be done by passing width=0, height=0.
+        """
+        if width == 0 or height == 0:
+            w, h = _detect_screen_size()
+            width = width or w
+            height = height or h
+
+        self._current_viewport = {"width": width, "height": height}
+
+        def _resize_all():
+            count = 0
+            for page in list(self._context.pages):
+                try:
+                    if not page.is_closed():
+                        page.set_viewport_size({"width": width, "height": height})
+                        count += 1
+                except Exception:
+                    pass
+            return count
+
+        loop = asyncio.get_event_loop()
+        count = await loop.run_in_executor(self._executor, _resize_all)
+
+        logger.info("Viewport resized to %dx%d on %d pages", width, height, count)
+        return {"status": "resized", "width": width, "height": height, "pages_affected": count}
+
+    def resize_viewport_sync(self, width: int, height: int) -> dict[str, Any]:
+        """Synchronous wrapper — call from within the executor thread."""
+        if width == 0 or height == 0:
+            w, h = _detect_screen_size()
+            width = width or w
+            height = height or h
+
+        self._current_viewport = {"width": width, "height": height}
+
+        count = 0
+        for page in list(self._context.pages):
+            try:
+                if not page.is_closed():
+                    page.set_viewport_size({"width": width, "height": height})
+                    count += 1
+            except Exception:
+                pass
+
+        logger.info("Viewport resized to %dx%d on %d pages", width, height, count)
+        return {"status": "resized", "width": width, "height": height, "pages_affected": count}
 
     async def switch_page(self, page_id: str) -> None:
         """Set the active page."""

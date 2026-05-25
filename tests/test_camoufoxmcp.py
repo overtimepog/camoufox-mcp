@@ -271,3 +271,59 @@ class TestServerCreation:
         page, pid = _resolve_page("my_page_id")
         assert pid == "my_page_id"
         mock_session.get_page.assert_called_once_with("my_page_id")
+
+
+class TestViewport:
+    """Test viewport resize and screen detection."""
+
+    def test_detect_screen_size_returns_tuple(self):
+        from camoufoxmcp.session import _detect_screen_size
+        w, h = _detect_screen_size()
+        assert isinstance(w, int)
+        assert isinstance(h, int)
+        assert w > 0
+        assert h > 0
+
+    def test_random_viewport_returns_dict(self):
+        from camoufoxmcp.session import _random_viewport
+        vp = _random_viewport()
+        assert "width" in vp and "height" in vp
+        assert vp["width"] > 0 and vp["height"] > 0
+
+    def test_resize_viewport_stores_and_updates(self):
+        from camoufoxmcp.session import BrowserSession
+        session = BrowserSession()
+        mock_page1 = MagicMock()
+        mock_page1.is_closed.return_value = False
+        mock_page2 = MagicMock()
+        mock_page2.is_closed.return_value = False
+        session._browser = MagicMock()
+        session._context = MagicMock()
+        session._context.pages = [mock_page1, mock_page2]
+        session._executor = MagicMock()
+        session._pages = {"p1": mock_page1, "p2": mock_page2}
+
+        result = session.resize_viewport_sync(1280, 720)
+        assert result["status"] == "resized"
+        assert result["width"] == 1280
+        assert result["height"] == 720
+        assert result["pages_affected"] == 2
+        assert session._current_viewport == {"width": 1280, "height": 720}
+        mock_page1.set_viewport_size.assert_called_once_with({"width": 1280, "height": 720})
+        mock_page2.set_viewport_size.assert_called_once_with({"width": 1280, "height": 720})
+
+    def test_resize_viewport_auto_detect(self):
+        from camoufoxmcp.session import BrowserSession
+        session = BrowserSession()
+        mock_page = MagicMock()
+        mock_page.is_closed.return_value = False
+        session._browser = MagicMock()
+        session._context = MagicMock()
+        session._context.pages = [mock_page]
+        session._executor = MagicMock()
+
+        result = session.resize_viewport_sync(0, 0)
+        assert result["status"] == "resized"
+        assert result["width"] > 0
+        assert result["height"] > 0
+        assert session._current_viewport is not None
