@@ -1,6 +1,9 @@
 """CamoufoxMCP server — stealth browser automation for AI agents.
 
-~21 tools. Snapshot-first. Two-tier Cloudflare bypass (cloudscraper + FlareSolverr).
+~35 tools. Snapshot-first. Two-tier Cloudflare bypass (cloudscraper + FlareSolverr).
+Bug bounty tools: JS extraction, network capture, authenticated API calls, token extraction.
+Playwright MCP parity: press keys, back/forward, console logs, tab management, cookies,
+file upload, annotated screenshots, real dialog capture.
 """
 
 from __future__ import annotations
@@ -101,9 +104,14 @@ async def _safe(handler, *args, **kwargs) -> dict[str, Any]:
 # Helpers
 # -----------------------------------------------------------------------
 
-async def _run_in_executor(self, func, *args, **kwargs):
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(self._executor, lambda: func(*args, **kwargs))
+def _resolve_page(page_id: str | None = None):
+    """Get page — use explicit page_id or fall back to active page."""
+    if page_id:
+        return _session.get_page(page_id), page_id
+    active = _session.active_page_id
+    if not active:
+        raise BrowserSessionError("No active page. Launch browser and navigate first.")
+    return _session.get_page(active), active
 
 
 # -----------------------------------------------------------------------
@@ -125,10 +133,22 @@ def create_server(caps: set[str] | None = None):
             "1. camoufox_launch() — start browser (headless or headed)\n"
             "2. camoufox_navigate(page_id, url) — go to URL\n"
             "3. camoufox_snapshot(page_id) — get interactive elements as [@eN] refs\n"
-            "4. camoufox_click / camoufox_type / camoufox_scroll — interact\n"
+            "4. camoufox_click / camoufox_type / camoufox_scroll / camoufox_press — interact\n"
             "5. camoufox_read_page(page_id) — page as clean markdown\n"
-            "6. camoufox_screenshot(page_id) — screenshot\n"
+            "6. camoufox_screenshot(page_id) — screenshot (with optional element annotation)\n"
             "7. camoufox_close() — done\n\n"
+            "KEYBOARD & NAVIGATION:\n"
+            "camoufox_press(page_id, key) — press Enter, Tab, Escape, ArrowDown, etc.\n"
+            "camoufox_back(page_id) — navigate back in history\n"
+            "camoufox_console(page_id) — get browser console messages (JS errors, warnings)\n\n"
+            "TAB MANAGEMENT:\n"
+            "camoufox_new_page() — open additional tab\n"
+            "camoufox_list_pages() — see all open tabs\n"
+            "camoufox_close_page(page_id) — close a tab\n\n"
+            "COOKIES:\n"
+            "camoufox_get_cookies(urls) — get browser cookies (optionally filtered)\n"
+            "camoufox_set_cookies(cookies) — set cookies\n"
+            "camoufox_clear_cookies() — clear all cookies\n\n"
             "CLOUDFLARE BYPASS (two tiers, escalate as needed):\n"
             "Tier 1 (fast, no Docker): camoufox_cloudscraper_fetch(url)\n"
             "  HTTP-level JS solver. Handles IUAM, v1, v2. ~100-500ms.\n"
@@ -141,13 +161,20 @@ def create_server(caps: set[str] | None = None):
             "WHEN BROWSER IS BLOCKED (camoufox_navigate → cloudflare_blocked=true):\n"
             "  1. camoufox_cloudscraper_fetch(url) — fast HTTP bypass\n"
             "  2. If blocked, camoufox_flaresolverr_fetch(url) — guaranteed bypass\n\n"
+            "BUG BOUNTY TOOLS:\n"
+            "camoufox_extract_tokens(page_id) — grab JWT, CSRF, cookies from session\n"
+            "camoufox_api_call(page_id, method, path) — make API call with browser auth\n"
+            "camoufox_js_extract(page_id) — find endpoints/secrets in loaded JS\n"
+            "camoufox_network_capture(page_id) — capture XHR/fetch traffic\n\n"
             "KEY DIFFERENCE from CloakBrowser:\n"
             "Camoufox is Firefox-based Playwright with two-tier Cloudflare bypass —\n"
             "cloudscraper (fast HTTP) → FlareSolverr (Docker Chromium, guaranteed)."
         ),
     )
 
-    # --- Browser lifecycle ---
+    # ==================================================================
+    # Browser lifecycle
+    # ==================================================================
 
     @mcp.tool()
     async def camoufox_launch(
@@ -227,14 +254,54 @@ def create_server(caps: set[str] | None = None):
         await _session.close()
         return {"status": "closed"}
 
-    # --- Navigation ---
+    # ==================================================================
+    # Page / tab management
+    # ==================================================================
+
+    @mcp.tool()
+    async def camoufox_new_page() -> dict[str, Any]:
+        """Open a new tab/page in the existing browser session.
+
+        The new page becomes the active page. Use camoufox_list_pages()
+        to see all open tabs, and camoufox_navigate() on the returned
+        page_id to load a URL.
+
+        Returns:
+            {"status": "created", "page_id": "page_abc123", "active": true}
+        """
+        page_id = await _session.new_page()
+        return {
+            "status": "created",
+            "page_id": page_id,
+            "active": True,
+            "hint": "Next: camoufox_navigate(page_id, url)",
+        }
+
+    @mcp.tool()
+    async def camoufox_close_page(page_id: str) -> dict[str, Any]:
+        """Close a specific page/tab.
+
+        Args:
+            page_id: Page ID to close.
+        """
+        await _session.close_page(page_id)
+        return {"status": "closed", "page_id": page_id}
+
+    @mcp.tool()
+    async def camoufox_list_pages() -> dict[str, Any]:
+        """List all open pages (page_id + URL)."""
+        return {"status": "ok", "pages": _session.list_pages()}
+
+    # ==================================================================
+    # Navigation
+    # ==================================================================
 
     @mcp.tool()
     async def camoufox_navigate(page_id: str, url: str, timeout: int = 30000) -> dict[str, Any]:
         """Navigate to a URL with smart waiting.
 
         Returns cloudflare_blocked=true if Cloudflare challenge detected.
-        In that case call camoufox_snapshot_if_blocked() next.
+        In that case call camoufox_cloudscraper_solve() or camoufox_flaresolverr_solve().
 
         Args:
             page_id: Target page ID from camoufox_launch or camoufox_new_page.
@@ -275,7 +342,27 @@ def create_server(caps: set[str] | None = None):
             ) if cf_blocked else None,
         }
 
-    # --- Snapshot (PRIMARY page understanding) ---
+    @mcp.tool()
+    async def camoufox_back(page_id: str | None = None) -> dict[str, Any]:
+        """Navigate back to the previous page in browser history.
+
+        Args:
+            page_id: Target page ID. Uses active page if omitted.
+        """
+        page, pid = _resolve_page(page_id)
+        loop = asyncio.get_event_loop()
+
+        def _back():
+            page.go_back(wait_until="domcontentloaded", timeout=15000)
+            page.wait_for_timeout(2000)
+            return {"url": page.url, "title": page.title()}
+
+        result = await loop.run_in_executor(_executor, _back)
+        return {"status": "navigated", "url": result["url"], "title": result["title"], "page_id": pid}
+
+    # ==================================================================
+    # Snapshot (PRIMARY page understanding)
+    # ==================================================================
 
     @mcp.tool()
     async def camoufox_snapshot(
@@ -297,7 +384,406 @@ def create_server(caps: set[str] | None = None):
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(_executor, take_snapshot, page, page_id, _session, full, max_length)
 
-    # --- Cloudscraper integration: HTTP-level CF bypass ---
+    # ==================================================================
+    # Keyboard & input
+    # ==================================================================
+
+    @mcp.tool()
+    async def camoufox_press(page_id: str | None = None, key: str = "Enter") -> dict[str, Any]:
+        """Press a keyboard key. Useful for submitting forms (Enter), navigating (Tab),
+        or keyboard shortcuts.
+
+        Args:
+            page_id: Target page ID. Uses active page if omitted.
+            key: Key to press (e.g., 'Enter', 'Tab', 'Escape', 'ArrowDown').
+        """
+        page, pid = _resolve_page(page_id)
+        loop = asyncio.get_event_loop()
+
+        def _press():
+            page.keyboard.press(key)
+            page.wait_for_timeout(500)
+            return {"status": "pressed", "key": key}
+
+        return await loop.run_in_executor(_executor, _press)
+
+    # ==================================================================
+    # Ref-based interaction
+    # ==================================================================
+
+    @mcp.tool()
+    async def camoufox_click(
+        page_id: str,
+        ref: str,
+        double: bool = False,
+    ) -> dict[str, Any]:
+        """Click an element by its [@eN] ref ID from camoufox_snapshot.
+
+        Auto-retries once if element moved.
+
+        Args:
+            page_id: Target page ID.
+            ref: Ref from snapshot e.g. '@e5' or 'e5'.
+            double: Double-click instead of single click (default: False).
+        """
+        page = _session.get_page(page_id)
+        clean_ref, selector, frame_idx = resolve_ref(_session, page_id, ref)
+        loop = asyncio.get_event_loop()
+
+        def _click():
+            target = page
+            if frame_idx is not None:
+                frames = page.frames
+                if frame_idx < len(frames):
+                    target = frames[frame_idx]
+            if double:
+                target.dblclick(selector, timeout=5000)
+            else:
+                target.click(selector, timeout=5000)
+            return {"status": "clicked", "ref": f"@{clean_ref}", "double": double}
+
+        try:
+            return await loop.run_in_executor(_executor, _click)
+        except Exception as exc:
+            # Retry once
+            def _retry():
+                target = page
+                if frame_idx is not None:
+                    frames = page.frames
+                    if frame_idx < len(frames):
+                        target = frames[frame_idx]
+                if double:
+                    target.dblclick(selector, timeout=5000)
+                else:
+                    target.click(selector, timeout=5000)
+                return {"status": "clicked", "ref": f"@{clean_ref}", "double": double}
+            try:
+                return await loop.run_in_executor(_executor, _retry)
+            except Exception:
+                return _err(f"Click failed: {exc}")
+
+    @mcp.tool()
+    async def camoufox_type(
+        page_id: str,
+        ref: str,
+        text: str,
+        clear: bool = True,
+        submit: bool = False,
+    ) -> dict[str, Any]:
+        """Type text into an input by ref from camoufox_snapshot.
+
+        Args:
+            page_id: Target page ID.
+            ref: Ref from snapshot.
+            text: Text to type.
+            clear: Clear field first (default: True).
+            submit: Press Enter after typing (default: False).
+        """
+        page = _session.get_page(page_id)
+        clean_ref, selector, frame_idx = resolve_ref(_session, page_id, ref)
+        loop = asyncio.get_event_loop()
+
+        def _type():
+            target = page
+            if frame_idx is not None:
+                frames = page.frames
+                if frame_idx < len(frames):
+                    target = frames[frame_idx]
+            if clear:
+                target.fill(selector, "")
+            target.type(selector, text)
+            if submit:
+                target.press(selector, "Enter")
+            return {"status": "typed", "ref": f"@{clean_ref}", "length": len(text), "submitted": submit}
+
+        return await loop.run_in_executor(_executor, _type)
+
+    @mcp.tool()
+    async def camoufox_select(
+        page_id: str,
+        ref: str,
+        value: str | None = None,
+        label: str | None = None,
+        index: int | None = None,
+    ) -> dict[str, Any]:
+        """Select a dropdown option by ref.
+
+        Provide exactly one of: value, label, or index.
+        """
+        page = _session.get_page(page_id)
+        clean_ref, selector, frame_idx = resolve_ref(_session, page_id, ref)
+        loop = asyncio.get_event_loop()
+
+        kwargs = {}
+        if value is not None:
+            kwargs["value"] = value
+        elif label is not None:
+            kwargs["label"] = label
+        elif index is not None:
+            kwargs["index"] = index
+        else:
+            return _err("Provide one of: value, label, or index.")
+
+        def _select():
+            target = page
+            if frame_idx is not None:
+                frames = page.frames
+                if frame_idx < len(frames):
+                    target = frames[frame_idx]
+            selected = target.select_option(selector, **kwargs)
+            return {"status": "selected", "ref": f"@{clean_ref}", "selected": selected}
+
+        return await loop.run_in_executor(_executor, _select)
+
+    @mcp.tool()
+    async def camoufox_hover(page_id: str, ref: str) -> dict[str, Any]:
+        """Hover over an element by ref."""
+        page = _session.get_page(page_id)
+        clean_ref, selector, frame_idx = resolve_ref(_session, page_id, ref)
+        loop = asyncio.get_event_loop()
+
+        def _hover():
+            target = page
+            if frame_idx is not None:
+                frames = page.frames
+                if frame_idx < len(frames):
+                    target = frames[frame_idx]
+            target.hover(selector)
+            return {"status": "hovered", "ref": f"@{clean_ref}"}
+
+        return await loop.run_in_executor(_executor, _hover)
+
+    @mcp.tool()
+    async def camoufox_scroll(
+        page_id: str,
+        direction: str = "down",
+        amount: int = 500,
+    ) -> dict[str, Any]:
+        """Scroll the page.
+
+        Args:
+            page_id: Target page ID.
+            direction: 'up' or 'down' (default: down).
+            amount: Pixels to scroll (default: 500).
+        """
+        page = _session.get_page(page_id)
+        loop = asyncio.get_event_loop()
+
+        def _scroll():
+            if direction == "up":
+                page.evaluate(f"window.scrollBy(0, -{amount})")
+            else:
+                page.evaluate(f"window.scrollBy(0, {amount})")
+            page.wait_for_timeout(300)
+            return {"status": "scrolled", "direction": direction, "amount": amount}
+
+        return await loop.run_in_executor(_executor, _scroll)
+
+    @mcp.tool()
+    async def camoufox_evaluate(page_id: str, expression: str) -> dict[str, Any]:
+        """Execute JavaScript in the page context.
+
+        Args:
+            page_id: Target page ID.
+            expression: JavaScript expression to evaluate.
+        """
+        page = _session.get_page(page_id)
+        loop = asyncio.get_event_loop()
+
+        def _eval():
+            result = page.evaluate(expression)
+            return {"status": "evaluated", "result": result}
+
+        return await loop.run_in_executor(_executor, _eval)
+
+    @mcp.tool()
+    async def camoufox_file_upload(page_id: str, ref: str, file_paths: str) -> dict[str, Any]:
+        """Upload files to a file input element identified by ref.
+
+        Args:
+            page_id: Target page ID.
+            ref: Ref from snapshot pointing to a file input.
+            file_paths: Comma-separated absolute file paths to upload.
+        """
+        page = _session.get_page(page_id)
+        clean_ref, selector, frame_idx = resolve_ref(_session, page_id, ref)
+        files = [p.strip() for p in file_paths.split(",") if p.strip()]
+        if not files:
+            return _err("No file paths provided.")
+
+        loop = asyncio.get_event_loop()
+
+        def _upload():
+            target = page
+            if frame_idx is not None:
+                frames = page.frames
+                if frame_idx < len(frames):
+                    target = frames[frame_idx]
+            target.set_input_files(selector, files)
+            return {"status": "uploaded", "ref": f"@{clean_ref}", "files": files, "count": len(files)}
+
+        return await loop.run_in_executor(_executor, _upload)
+
+    # ==================================================================
+    # Content extraction
+    # ==================================================================
+
+    @mcp.tool()
+    async def camoufox_read_page(page_id: str, max_length: int = 50000) -> dict[str, Any]:
+        """Extract page content as clean markdown.
+
+        Uses trafilatura (production-grade readability) when available,
+        falls back to regex-based extraction. Strips navigation, ads, footers.
+
+        Args:
+            page_id: Target page ID.
+            max_length: Max characters (default: 50000).
+        """
+        page = _session.get_page(page_id)
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(_executor, extract_markdown, page, max_length)
+
+    @mcp.tool()
+    async def camoufox_screenshot(
+        page_id: str,
+        full_page: bool = False,
+        annotate: bool = False,
+    ) -> dict[str, Any]:
+        """Take a screenshot, optionally with numbered element annotations.
+
+        When annotate=True, overlays numbered badges [1] [2] ... on interactive
+        elements. Match badge numbers to [@eN] refs from camoufox_snapshot().
+
+        Args:
+            page_id: Target page ID.
+            full_page: Capture entire scrollable page (default: False).
+            annotate: Overlay numbered element indices (default: False).
+        """
+        page = _session.get_page(page_id)
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            _executor, take_screenshot, page, full_page, annotate, _session, page_id,
+        )
+
+    @mcp.tool()
+    async def camoufox_wait(page_id: str, timeout_ms: int = 5000) -> dict[str, Any]:
+        """Wait for the page to settle (no DOM mutations + network idle).
+
+        Args:
+            page_id: Target page ID.
+            timeout_ms: Max wait time in ms (default: 5000).
+        """
+        page = _session.get_page(page_id)
+        loop = asyncio.get_event_loop()
+
+        def _wait():
+            page.wait_for_load_state("networkidle", timeout=timeout_ms / 1000)
+            return {"status": "settled", "elapsed_ms": timeout_ms}
+
+        try:
+            return await loop.run_in_executor(_executor, _wait)
+        except Exception:
+            return {"status": "not_settled", "elapsed_ms": timeout_ms, "note": "networkidle timeout reached"}
+
+    # ==================================================================
+    # Dialogs & console
+    # ==================================================================
+
+    @mcp.tool()
+    async def camoufox_get_dialogs(
+        page_id: str | None = None,
+        filter_text: str | None = None,
+    ) -> dict[str, Any]:
+        """Get captured JavaScript dialogs (alert/confirm/prompt).
+
+        Dialogs are auto-dismissed to prevent blocking. This retrieves the log.
+
+        Args:
+            page_id: Target page ID. Uses active page if omitted.
+            filter_text: Optional — only return dialogs containing this string.
+        """
+        _, pid = _resolve_page(page_id)
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(_executor, _session.get_dialogs, pid, filter_text)
+
+    @mcp.tool()
+    async def camoufox_console(
+        page_id: str | None = None,
+        filter_text: str | None = None,
+        clear: bool = False,
+    ) -> dict[str, Any]:
+        """Get browser console messages (JS errors, warnings, logs).
+
+        Useful for debugging JavaScript errors on the page, finding which
+        API calls failed, and discovering app behaviour.
+
+        Args:
+            page_id: Target page ID. Uses active page if omitted.
+            filter_text: Optional — only return messages containing this string.
+            clear: If true, clear console messages after reading.
+        """
+        _, pid = _resolve_page(page_id)
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(_executor, _session.get_console, pid, filter_text, clear)
+
+    # ==================================================================
+    # Cookie management
+    # ==================================================================
+
+    @mcp.tool()
+    async def camoufox_get_cookies(urls: str | None = None) -> dict[str, Any]:
+        """Get cookies from the browser context.
+
+        Args:
+            urls: Optional comma-separated URLs to filter cookies by domain.
+                  If omitted, returns all cookies.
+        """
+        url_list = [u.strip() for u in urls.split(",") if u.strip()] if urls else None
+        loop = asyncio.get_event_loop()
+
+        def _get():
+            cookies = _session.get_cookies(url_list)
+            return {"status": "ok", "cookies": cookies, "count": len(cookies)}
+
+        return await loop.run_in_executor(_executor, _get)
+
+    @mcp.tool()
+    async def camoufox_set_cookies(cookies_json: str) -> dict[str, Any]:
+        """Set cookies in the browser context.
+
+        Args:
+            cookies_json: JSON string of cookie objects, e.g.
+                '[{"name":"session","value":"abc","domain":".example.com","path":"/"}]'
+        """
+        try:
+            cookies = json.loads(cookies_json)
+            if not isinstance(cookies, list):
+                return _err("cookies_json must be a JSON array of cookie objects.")
+        except json.JSONDecodeError as e:
+            return _err(f"Invalid JSON: {e}")
+
+        loop = asyncio.get_event_loop()
+
+        def _set():
+            _session.set_cookies(cookies)
+            return {"status": "set", "count": len(cookies)}
+
+        return await loop.run_in_executor(_executor, _set)
+
+    @mcp.tool()
+    async def camoufox_clear_cookies() -> dict[str, Any]:
+        """Clear all cookies from the browser context."""
+        loop = asyncio.get_event_loop()
+
+        def _clear():
+            _session.clear_cookies()
+            return {"status": "cleared"}
+
+        return await loop.run_in_executor(_executor, _clear)
+
+    # ==================================================================
+    # Cloudscraper integration: HTTP-level CF bypass
+    # ==================================================================
 
     @mcp.tool()
     async def camoufox_cloudscraper_fetch(
@@ -323,7 +809,7 @@ def create_server(caps: set[str] | None = None):
         Args:
             url: Full URL to fetch.
             max_length: Max characters in returned content (default: 50000).
-            proxy: Optional proxy URL e.g. 'http://user:pass@host:port'.
+            proxy: Optional proxy URL e.g. 'http://user:***@host:port'.
             timeout: Request timeout in seconds (default: 30).
 
         Returns:
@@ -389,9 +875,9 @@ def create_server(caps: set[str] | None = None):
             timeout,
         )
 
-    # --- FlareSolverr integration: Docker-based CF bypass (hardest challenges) ---
-    # Auto-start: camoufox_flaresolverr_fetch will start FlareSolverr if needed
-    # Manage manually: camoufox_flaresolverr_start / _stop
+    # ==================================================================
+    # FlareSolverr integration: Docker-based CF bypass (hardest challenges)
+    # ==================================================================
 
     @mcp.tool()
     async def camoufox_flaresolverr_start() -> dict[str, Any]:
@@ -557,10 +1043,8 @@ def create_server(caps: set[str] | None = None):
                         "error": "Could not extract domain from URL"}
 
             # Step 4: Set up persistent route interception
-            # Only proxy main document requests — subresources (CSS/JS/images)
-            # load directly since CF typically only challenges the first page load.
+            # Only proxy main document/xhr/fetch requests — subresources load directly
             def _proxy_route(route):
-                # Only intercept document-level requests (navigations, not subresources)
                 if route.request.resource_type not in ("document", "xhr", "fetch"):
                     route.continue_()
                     return
@@ -610,265 +1094,294 @@ def create_server(caps: set[str] | None = None):
 
         return await loop.run_in_executor(_executor, _solve_and_setup_proxy)
 
-    # --- Ref-based interaction ---
+    # ==================================================================
+    # Bug bounty / authenticated API tools
+    # ==================================================================
 
     @mcp.tool()
-    async def camoufox_click(page_id: str, ref: str) -> dict[str, Any]:
-        """Click an element by its [@eN] ref ID from camoufox_snapshot.
+    async def camoufox_extract_tokens(page_id: str) -> dict[str, Any]:
+        """Extract authentication tokens from the current page context.
 
-        Auto-retries once if element moved.
+        Pulls JWT, CSRF token, session cookies, and API keys from the browser's
+        current session. Use this after logging in to capture credentials for
+        direct API testing.
 
         Args:
             page_id: Target page ID.
-            ref: Ref from snapshot e.g. '@e5' or 'e5'.
-        """
-        page = _session.get_page(page_id)
-        clean_ref, selector, frame_idx = resolve_ref(_session, page_id, ref)
-        loop = asyncio.get_event_loop()
-
-        def _click():
-            target = page
-            if frame_idx is not None:
-                frames = page.frames
-                if frame_idx < len(frames):
-                    target = frames[frame_idx]
-            target.click(selector, timeout=5000)
-            return {"status": "clicked", "ref": f"@{clean_ref}"}
-
-        try:
-            return await loop.run_in_executor(_executor, _click)
-        except Exception as exc:
-            # Retry once
-            def _retry():
-                target = page
-                if frame_idx is not None:
-                    frames = page.frames
-                    if frame_idx < len(frames):
-                        target = frames[frame_idx]
-                target.click(selector, timeout=5000)
-                return {"status": "clicked", "ref": f"@{clean_ref}"}
-            try:
-                return await loop.run_in_executor(_executor, _retry)
-            except Exception:
-                return _err(f"Click failed: {exc}")
-
-    @mcp.tool()
-    async def camoufox_type(
-        page_id: str,
-        ref: str,
-        text: str,
-        clear: bool = True,
-        submit: bool = False,
-    ) -> dict[str, Any]:
-        """Type text into an input by ref from camoufox_snapshot.
-
-        Args:
-            page_id: Target page ID.
-            ref: Ref from snapshot.
-            text: Text to type.
-            clear: Clear field first (default: True).
-            submit: Press Enter after typing (default: False).
-        """
-        page = _session.get_page(page_id)
-        clean_ref, selector, frame_idx = resolve_ref(_session, page_id, ref)
-        loop = asyncio.get_event_loop()
-
-        def _type():
-            target = page
-            if frame_idx is not None:
-                frames = page.frames
-                if frame_idx < len(frames):
-                    target = frames[frame_idx]
-            if clear:
-                target.fill(selector, "")
-            target.type(selector, text)
-            if submit:
-                target.press(selector, "Enter")
-            return {"status": "typed", "ref": f"@{clean_ref}", "length": len(text), "submitted": submit}
-
-        return await loop.run_in_executor(_executor, _type)
-
-    @mcp.tool()
-    async def camoufox_select(
-        page_id: str,
-        ref: str,
-        value: str | None = None,
-        label: str | None = None,
-        index: int | None = None,
-    ) -> dict[str, Any]:
-        """Select a dropdown option by ref.
-
-        Provide exactly one of: value, label, or index.
-        """
-        page = _session.get_page(page_id)
-        clean_ref, selector, frame_idx = resolve_ref(_session, page_id, ref)
-        loop = asyncio.get_event_loop()
-
-        kwargs = {}
-        if value is not None:
-            kwargs["value"] = value
-        elif label is not None:
-            kwargs["label"] = label
-        elif index is not None:
-            kwargs["index"] = index
-        else:
-            return _err("Provide one of: value, label, or index.")
-
-        def _select():
-            target = page
-            if frame_idx is not None:
-                frames = page.frames
-                if frame_idx < len(frames):
-                    target = frames[frame_idx]
-            selected = target.select_option(selector, **kwargs)
-            return {"status": "selected", "ref": f"@{clean_ref}", "selected": selected}
-
-        return await loop.run_in_executor(_executor, _select)
-
-    @mcp.tool()
-    async def camoufox_hover(page_id: str, ref: str) -> dict[str, Any]:
-        """Hover over an element by ref."""
-        page = _session.get_page(page_id)
-        clean_ref, selector, frame_idx = resolve_ref(_session, page_id, ref)
-        loop = asyncio.get_event_loop()
-
-        def _hover():
-            target = page
-            if frame_idx is not None:
-                frames = page.frames
-                if frame_idx < len(frames):
-                    target = frames[frame_idx]
-            target.hover(selector)
-            return {"status": "hovered", "ref": f"@{clean_ref}"}
-
-        return await loop.run_in_executor(_executor, _hover)
-
-    @mcp.tool()
-    async def camoufox_scroll(
-        page_id: str,
-        direction: str = "down",
-        amount: int = 500,
-    ) -> dict[str, Any]:
-        """Scroll the page.
-
-        Args:
-            page_id: Target page ID.
-            direction: 'up' or 'down' (default: down).
-            amount: Pixels to scroll (default: 500).
         """
         page = _session.get_page(page_id)
         loop = asyncio.get_event_loop()
 
-        def _scroll():
-            if direction == "up":
-                page.evaluate(f"window.scrollBy(0, -{amount})")
-            else:
-                page.evaluate(f"window.scrollBy(0, {amount})")
-            page.wait_for_timeout(300)
-            return {"status": "scrolled", "direction": direction, "amount": amount}
+        def _extract():
+            tokens = page.evaluate("""
+                () => {
+                    const result = {};
 
-        return await loop.run_in_executor(_executor, _scroll)
+                    // Cookies
+                    result.cookies = document.cookie ? document.cookie.split(';').map(c => c.trim()).filter(Boolean) : [];
 
-    @mcp.tool()
-    async def camoufox_evaluate(page_id: str, expression: str) -> dict[str, Any]:
-        """Execute JavaScript in the page context.
+                    // CSRF from meta tags
+                    const csrfMeta = document.querySelector('meta[name="csrf-token"], meta[name="csrf"], meta[name="_csrf"], meta[name="csrf-param"]');
+                    if (csrfMeta) result.metaCsrf = csrfMeta.content || csrfMeta.getAttribute('value');
 
-        Args:
-            page_id: Target page ID.
-            expression: JavaScript expression to evaluate.
-        """
-        page = _session.get_page(page_id)
-        loop = asyncio.get_event_loop()
-
-        def _eval():
-            result = page.evaluate(expression)
-            return {"status": "evaluated", "result": result}
-
-        return await loop.run_in_executor(_executor, _eval)
-
-    # --- Content extraction ---
-
-    @mcp.tool()
-    async def camoufox_read_page(page_id: str, max_length: int = 50000) -> dict[str, Any]:
-        """Extract page content as clean markdown.
-
-        Strips navigation, ads, footers — returns just main content.
-
-        Args:
-            page_id: Target page ID.
-            max_length: Max characters (default: 50000).
-        """
-        page = _session.get_page(page_id)
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(_executor, extract_markdown, page, max_length)
-
-    @mcp.tool()
-    async def camoufox_screenshot(page_id: str, full_page: bool = False) -> dict[str, Any]:
-        """Take an annotated screenshot with element indices overlaid.
-
-        Args:
-            page_id: Target page ID.
-            full_page: Capture entire scrollable page (default: False).
-        """
-        page = _session.get_page(page_id)
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(_executor, take_screenshot, page, full_page)
-
-    @mcp.tool()
-    async def camoufox_wait(page_id: str, timeout_ms: int = 5000) -> dict[str, Any]:
-        """Wait for the page to settle (no DOM mutations + network idle).
-
-        Args:
-            page_id: Target page ID.
-            timeout_ms: Max wait time in ms (default: 5000).
-        """
-        page = _session.get_page(page_id)
-        loop = asyncio.get_event_loop()
-
-        def _wait():
-            page.wait_for_load_state("networkidle", timeout=timeout_ms / 1000)
-            return {"status": "settled", "elapsed_ms": timeout_ms}
-
-        try:
-            return await loop.run_in_executor(_executor, _wait)
-        except Exception:
-            return {"status": "not_settled", "elapsed_ms": timeout_ms, "note": "networkidle timeout reached"}
-
-    @mcp.tool()
-    async def camoufox_get_dialogs(page_id: str, filter_text: str | None = None) -> dict[str, Any]:
-        """Get captured JavaScript dialogs (alert/confirm/prompt).
-
-        Dialogs are auto-accepted to prevent blocking. This retrieves the log.
-
-        Args:
-            page_id: Target page ID.
-            filter_text: Optional — only return dialogs containing this string.
-        """
-        page = _session.get_page(page_id)
-        loop = asyncio.get_event_loop()
-
-        def _get_dialogs():
-            # Playwright captures dialog events - get them from page context
-            # We store dialogs in a JS variable on the page
-            try:
-                result = page.evaluate("""
-                    () => {
-                        if (!window._camoufox_dialogs) return [];
-                        return window._camoufox_dialogs;
+                    // Try localStorage for common token keys
+                    const storageTokens = {};
+                    for (const key of ['jwtToken', 'csrfToken', 'token', 'auth', 'authToken', 'accessToken', 'access_token', 'idToken', 'refreshToken', 'refresh_token']) {
+                        try {
+                            const val = localStorage.getItem(key);
+                            if (val) storageTokens[key] = val.length > 80 ? (val.slice(0, 40) + '...' + val.slice(-20)) : val;
+                        } catch(e) {}
                     }
-                """)
-                dialogs = json.loads(result) if result else []
-                if filter_text:
-                    dialogs = [d for d in dialogs if filter_text.lower() in d.get("message", "").lower()]
-                return {"status": "ok", "dialogs": dialogs, "count": len(dialogs)}
-            except Exception:
-                return {"status": "ok", "dialogs": [], "count": 0, "note": "No dialogs captured"}
+                    if (Object.keys(storageTokens).length) result.storageTokens = storageTokens;
 
-        return await loop.run_in_executor(_executor, _get_dialogs)
+                    // sessionStorage
+                    const sessionTokens = {};
+                    for (const key of ['jwtToken', 'csrfToken', 'token', 'auth', 'authToken', 'accessToken']) {
+                        try {
+                            const val = sessionStorage.getItem(key);
+                            if (val) sessionTokens[key] = val.length > 80 ? (val.slice(0, 40) + '...' + val.slice(-20)) : val;
+                        } catch(e) {}
+                    }
+                    if (Object.keys(sessionTokens).length) result.sessionTokens = sessionTokens;
+
+                    // Check for JWT in Authorization header pattern (from XHR intercepts)
+                    result.note = 'Injected JWT/CSRF are NOT captured here. Login as a user, then call this tool.';
+
+                    return result;
+                }
+            """)
+            return {"status": "ok", "tokens": tokens}
+
+        return await loop.run_in_executor(_executor, _extract)
 
     @mcp.tool()
-    async def camoufox_list_pages() -> dict[str, Any]:
-        """List all open pages (page_id + URL)."""
-        return {"status": "ok", "pages": _session.list_pages()}
+    async def camoufox_api_call(
+        page_id: str,
+        method: str,
+        path: str,
+        body: str | None = None,
+        content_type: str = "application/json",
+    ) -> dict[str, Any]:
+        """Make an API call using the browser's authenticated session.
+
+        Uses the browser's cookies, and auto-detects CSRF tokens from meta tags
+        or localStorage. Works with any web app — no hardcoded paths.
+
+        Args:
+            page_id: Target page ID.
+            method: HTTP method (GET, POST, PUT, PATCH, DELETE).
+            path: API path (e.g. '/api/v1/users/1').
+            body: JSON body for POST/PUT/PATCH requests.
+            content_type: Content-Type header (default: application/json).
+        """
+        page = _session.get_page(page_id)
+        loop = asyncio.get_event_loop()
+
+        # Escape for safe embedding in JS template
+        safe_path = path.replace("\\", "\\\\").replace("'", "\\'")
+        safe_method = method.upper()
+        safe_content_type = content_type.replace("\\", "\\\\").replace("'", "\\'")
+        body_str = json.dumps(body) if body else "null"
+
+        def _call():
+            result = page.evaluate(f"""
+                async () => {{
+                    try {{
+                        // Get CSRF from meta tags or localStorage
+                        let csrf = '';
+                        const csrfMeta = document.querySelector('meta[name="csrf-token"], meta[name="csrf"], meta[name="_csrf"]');
+                        if (csrfMeta) csrf = csrfMeta.content || csrfMeta.getAttribute('value') || '';
+                        if (!csrf) {{
+                            for (const key of ['csrfToken', 'csrf-token', '_csrf']) {{
+                                try {{ csrf = localStorage.getItem(key) || ''; if (csrf) break; }} catch(e) {{}}
+                            }}
+                        }}
+
+                        const headers = {{
+                            'Accept': 'application/json',
+                            'Content-Type': '{safe_content_type}',
+                        }};
+                        if (csrf && !['GET', 'HEAD', 'OPTIONS'].includes('{safe_method}')) {{
+                            headers['X-CSRF-Token'] = csrf;
+                            headers['X-CSRFToken'] = csrf;
+                        }}
+
+                        const fetchOpts = {{
+                            method: '{safe_method}',
+                            headers: headers,
+                            credentials: 'include',
+                        }};
+                        if (['POST', 'PUT', 'PATCH'].includes('{safe_method}') && {body_str}) {{
+                            fetchOpts.body = JSON.stringify({body_str});
+                        }}
+
+                        const resp = await fetch('{safe_path}', fetchOpts);
+                        const text = await resp.text();
+                        let data;
+                        try {{ data = JSON.parse(text); }} catch(e) {{ data = text; }}
+
+                        return {{
+                            status: resp.status,
+                            statusText: resp.statusText,
+                            data: typeof data === 'string' ? data.slice(0, 5000) : data,
+                            headers: Object.fromEntries(resp.headers.entries())
+                        }};
+                    }} catch(e) {{
+                        return {{ error: e.message }};
+                    }}
+                }}
+            """)
+            return {"status": "ok", "method": safe_method, "path": path, **result}
+
+        return await loop.run_in_executor(_executor, _call)
+
+    @mcp.tool()
+    async def camoufox_js_extract(
+        page_id: str,
+        search_patterns: str = "api,csrf,token,secret,key,endpoint,graphql,websocket,admin,support",
+    ) -> dict[str, Any]:
+        """Extract API endpoints, secrets, and auth logic from loaded JS bundles.
+
+        Downloads all JS files loaded on the current page, searches them for
+        API paths, authentication tokens, and other security-relevant patterns.
+        Use this to discover hidden API endpoints and understand the auth flow.
+
+        Args:
+            page_id: Target page ID.
+            search_patterns: Comma-separated patterns to search for.
+        """
+        page = _session.get_page(page_id)
+        loop = asyncio.get_event_loop()
+
+        def _extract():
+            result = page.evaluate(f"""
+                () => {{
+                    const patterns = '{search_patterns}'.split(',').map(p => p.trim());
+                    const results = {{ endpoints: [], secrets: [], authPatterns: [] }};
+
+                    // Get all script URLs from the page
+                    const scripts = Array.from(document.querySelectorAll('script[src]'));
+                    const scriptUrls = scripts.map(s => s.src).filter(s => s);
+
+                    // Also check inline scripts
+                    const inlineScripts = Array.from(document.querySelectorAll('script:not([src])'))
+                        .map(s => s.textContent).filter(t => t && t.length > 100);
+
+                    // Extract API paths from all scripts
+                    const allText = inlineScripts.join('\\n');
+                    const apiPaths = allText.match(/['"`]\\/api\\/[a-zA-Z0-9_\\/.-]+['\"`]/g) || [];
+                    results.endpoints = [...new Set(apiPaths.map(p => p.replace(/['\"`]/g, '')))].slice(0, 100);
+
+                    // Search for secrets/keys
+                    for (const pattern of ['secret', 'key', 'token', 'password']) {{
+                        const re = new RegExp(pattern + '[\\\\s]*[=:][\\\\s]*['\\\"`]([^'\\\"`]{{8,}})['\\\"`]', 'gi');
+                        let match;
+                        while ((match = re.exec(allText)) !== null) {{
+                            if (!match[1].includes('{{') && !match[1].includes('function') && !match[1].includes('require')) {{
+                                results.secrets.push({{ pattern, value: match[1].slice(0, 40) + '...', source: 'inline' }});
+                            }}
+                        }}
+                    }}
+
+                    // Look for auth-related patterns
+                    const authPatterns = allText.match(/['\"`](csrf|jwt|bearer|authorization|authenticate|oauth)['\"`]/gi) || [];
+                    results.authPatterns = [...new Set(authPatterns.map(a => a.replace(/['\"`]/g, '')))];
+
+                    // Count JS files
+                    results.scriptCount = scriptUrls.length;
+                    results.scriptUrls = scriptUrls.slice(0, 20);
+
+                    return results;
+                }}
+            """)
+            return {"status": "ok", **result}
+
+        return await loop.run_in_executor(_executor, _extract)
+
+    @mcp.tool()
+    async def camoufox_network_capture(
+        page_id: str,
+        url_filter: str | None = None,
+        clear: bool = False,
+    ) -> dict[str, Any]:
+        """Capture browser network requests for API endpoint discovery.
+
+        Monitors XHR/fetch requests made by the page. Use this to discover
+        real API endpoints by interacting with the page and then capturing
+        what requests the React app actually makes.
+
+        Args:
+            page_id: Target page ID.
+            url_filter: Optional substring filter for request URLs.
+            clear: If true, clear captured requests after reading.
+        """
+        page = _session.get_page(page_id)
+        loop = asyncio.get_event_loop()
+
+        def _capture():
+            # Ensure the capture array exists
+            page.evaluate("""
+                if (!window._camoufox_network) {
+                    window._camoufox_network = [];
+                    const origFetch = window.fetch;
+                    window.fetch = function(...args) {
+                        const entry = {
+                            url: typeof args[0] === 'string' ? args[0] : args[0].url,
+                            method: (args[1] && args[1].method) || 'GET',
+                            body: (args[1] && args[1].body) ? String(args[1].body).slice(0, 500) : null,
+                            timestamp: Date.now()
+                        };
+                        window._camoufox_network.push(entry);
+                        return origFetch.apply(this, args);
+                    };
+
+                    // Also hook XHR
+                    const origXHROpen = XMLHttpRequest.prototype.open;
+                    XMLHttpRequest.prototype.open = function(method, url) {
+                        this._camoufox_method = method;
+                        this._camoufox_url = url;
+                        this._camoufox_start = Date.now();
+                        return origXHROpen.apply(this, arguments);
+                    };
+                    const origXHRSend = XMLHttpRequest.prototype.send;
+                    XMLHttpRequest.prototype.send = function(body) {
+                        window._camoufox_network.push({
+                            url: this._camoufox_url,
+                            method: this._camoufox_method,
+                            body: body ? String(body).slice(0, 500) : null,
+                            timestamp: this._camoufox_start,
+                            type: 'xhr'
+                        });
+                        return origXHRSend.apply(this, arguments);
+                    };
+                }
+            """)
+
+            # Get captured requests — properly handle clear parameter
+            url_filter_js = "null" if url_filter is None else f"'{url_filter}'"
+            clear_js = "true" if clear else "false"
+
+            raw = page.evaluate(f"""
+                () => {{
+                    const requests = window._camoufox_network || [];
+                    const filter = {url_filter_js};
+                    const shouldClear = {clear_js};
+                    const filtered = filter
+                        ? requests.filter(r => r.url && r.url.includes(filter))
+                        : requests;
+                    const result = {{
+                        total: requests.length,
+                        filtered: filtered.length,
+                        requests: filtered.slice(-50)  // Last 50 requests
+                    }};
+                    if (shouldClear) {{
+                        window._camoufox_network = [];
+                    }}
+                    return result;
+                }}
+            """)
+            return {"status": "ok", **raw}
+
+        return await loop.run_in_executor(_executor, _capture)
 
     return mcp

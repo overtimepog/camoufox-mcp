@@ -3,12 +3,17 @@
 Uses a two-pass approach:
   1. JS injection: collect interactive DOM elements with their CSS selectors + a11y info
   2. Build a human-readable tree with @eN refs that map to real selectors
+
+Playwright MCP quality improvements:
+  - Wider interactive element coverage (onclick, [contenteditable], form elements, etc.)
+  - Landmark/region detection for page structure
+  - Smarter text extraction for non-interactive containers
+  - Cross-origin iframe handling with graceful fallback
 """
 
 from __future__ import annotations
 
 import re
-import uuid
 from typing import Any
 
 
@@ -16,18 +21,45 @@ SNAPSHOT_JS = r"""
 (() => {
   const MAX_DEPTH = 12;
   const TEXT_LIMIT = 50;
-  const MAX_REFS = 200;
+  const MAX_REFS = 300;
 
-  // Interactive element selectors (matches Playwright a11y roles)
+  // Interactive element selectors — comprehensive coverage matching Playwright a11y + DOM
   const INTERACTIVE_SELECTORS = [
-    'a[href]', 'button', 'input', 'select', 'textarea',
+    // Native interactive elements
+    'a[href]', 'a:not([href])',  // links (even empty href — they might be JS-driven)
+    'button', 'input', 'select', 'textarea', 'datalist', 'optgroup', 'option',
+    'fieldset', 'legend', 'label',
+    // ARIA roles
     '[role="button"]', '[role="link"]', '[role="checkbox"]', '[role="radio"]',
     '[role="tab"]', '[role="menuitem"]', '[role="switch"]', '[role="combobox"]',
     '[role="slider"]', '[role="spinbutton"]', '[role="textbox"]', '[role="searchbox"]',
     '[role="listbox"]', '[role="option"]', '[role="menuitemcheckbox"]', '[role="menuitemradio"]',
     '[role="treeitem"]', '[role="tree"]', '[role="grid"]', '[role="row"]',
-    '[tabindex]:not([tabindex="-1"])', '[contenteditable="true"]',
-    'summary', 'details > summary'
+    '[role="gridcell"]', '[role="columnheader"]', '[role="rowheader"]',
+    '[role="separator"]', '[role="scrollbar"]',
+    // Focusable
+    '[tabindex]:not([tabindex="-1"])',
+    // Editable
+    '[contenteditable="true"]', '[contenteditable=""]',
+    // Expandable
+    'summary', 'details',
+    // Event-driven (onclick and friends — heuristic for JS-driven interactivity)
+    '[onclick]', '[ondblclick]', '[onmousedown]', '[onmouseup]',
+    '[onsubmit]', '[onreset]', '[onchange]', '[oninput]',
+    '[onkeydown]', '[onkeyup]', '[onkeypress]',
+    // Form-associated
+    'datalist', 'output', 'meter', 'progress',
+  ];
+
+  // Landmark/region roles — structural elements worth reporting even if non-interactive
+  const LANDMARK_SELECTORS = [
+    '[role="navigation"]', '[role="banner"]', '[role="contentinfo"]',
+    '[role="main"]', '[role="complementary"]', '[role="form"]',
+    '[role="search"]', '[role="region"]', '[role="application"]',
+    '[role="dialog"]', '[role="alertdialog"]', '[role="alert"]',
+    '[role="log"]', '[role="status"]', '[role="timer"]',
+    '[role="tooltip"]', '[role="menu"]', '[role="menubar"]',
+    'nav', 'header', 'footer', 'main', 'aside', 'section', 'article',
   ];
 
   // Visibility check
@@ -46,24 +78,35 @@ SNAPSHOT_JS = r"""
     if (!el || el === document.body || el === document.documentElement) return 'body';
 
     // 1. data-testid / data-test-id takes priority
-    for (const attr of ['data-testid', 'data-test-id', 'data-cy', 'data-e2e']) {
+    for (const attr of ['data-testid', 'data-test-id', 'data-cy', 'data-e2e', 'data-qa']) {
       if (el.hasAttribute(attr)) {
         return el.tagName.toLowerCase() + '[' + attr + '="' +
           el.getAttribute(attr).replace(/"/g, '\\"') + '"]';
       }
     }
 
-    // 2. id is unique
+    // 2. name attribute (for inputs/forms)
+    if (['input', 'select', 'textarea', 'button', 'form', 'fieldset'].includes(el.tagName.toLowerCase()) && el.name) {
+      return el.tagName.toLowerCase() + '[name="' + el.name.replace(/"/g, '\\"') + '"]';
+    }
+
+    // 3. id is unique
     if (el.id) {
-      const safeId = el.id.replace(/"/g, '\\"');
       const sel = '#' + CSS.escape(el.id);
       if (document.querySelectorAll(sel).length === 1) return sel;
     }
 
-    // 3. Build path with classes and nth-of-type
+    // 4. aria-label unique enough?
+    if (el.getAttribute('aria-label')) {
+      const escaped = el.getAttribute('aria-label').replace(/"/g, '\\"');
+      const sel = el.tagName.toLowerCase() + '[aria-label="' + escaped + '"]';
+      if (document.querySelectorAll(sel).length <= 3) return sel;
+    }
+
+    // 5. Build path with classes and nth-of-type
     const parts = [];
     let cur = el;
-    for (let i = 0; i < 4 && cur && cur !== document.body; i++) {
+    for (let i = 0; i < 5 && cur && cur !== document.body && cur !== document.documentElement; i++) {
       let seg = cur.tagName.toLowerCase();
       if (cur.id) {
         seg = '#' + CSS.escape(cur.id);
@@ -87,7 +130,7 @@ SNAPSHOT_JS = r"""
       parts.unshift(seg);
       cur = parent;
     }
-    return parts.join(' > ') || 'body';
+    return parts.join(' > ') || ('body > ' + el.tagName.toLowerCase());
   }
 
   // Get label/description for an element
@@ -108,12 +151,36 @@ SNAPSHOT_JS = r"""
     const parentLabel = el.closest('label');
     if (parentLabel) {
       const clone = parentLabel.cloneNode(true);
-      clone.querySelectorAll('input,select,textarea').forEach(i => i.remove());
+      clone.querySelectorAll('input,select,textarea,button').forEach(i => i.remove());
       const text = clone.textContent.trim();
       if (text) return text;
     }
+    // For links/buttons: use their own visible text as label if short
+    if (['a', 'button'].includes(el.tagName.toLowerCase())) {
+      const ownText = (el.textContent || '').replace(/\s+/g, ' ').trim();
+      if (ownText.length <= 80) return ownText;
+    }
     if (el.getAttribute('title')) return el.getAttribute('title').trim();
     if (el.getAttribute('placeholder')) return el.getAttribute('placeholder').trim();
+    return '';
+  }
+
+  // Get input value preview
+  function getValue(el) {
+    const tag = el.tagName.toLowerCase();
+    if (tag === 'input') {
+      const type = (el.getAttribute('type') || 'text').toLowerCase();
+      if (['checkbox', 'radio'].includes(type)) return el.checked ? '✓ checked' : '☐ unchecked';
+      if (type === 'file') return el.files && el.files.length ? el.files.length + ' file(s)' : '';
+      if (['hidden', 'image', 'button', 'submit', 'reset'].includes(type)) return '';
+      return el.value || '(empty)';
+    }
+    if (tag === 'select') {
+      const opts = el.selectedOptions;
+      if (opts && opts.length) return Array.from(opts).map(o => o.text).join(', ');
+      return '(none selected)';
+    }
+    if (tag === 'textarea') return el.value ? '"' + el.value.trim().slice(0, 40) + '"' : '(empty)';
     return '';
   }
 
@@ -130,13 +197,13 @@ SNAPSHOT_JS = r"""
       tag: el.tagName.toLowerCase(),
       role: el.getAttribute('role') || '',
       label: getLabel(el),
+      value: getValue(el),
     };
     return key;
   }
 
   // Build tree lines
   const lines = [];
-  let inIframe = false;
 
   function describeElement(el, depth, frameIndex) {
     if (depth > MAX_DEPTH) return;
@@ -157,6 +224,10 @@ SNAPSHOT_JS = r"""
       try { return el.matches(sel); } catch(e) { return false; }
     });
 
+    const isLandmark = !isInteractive && LANDMARK_SELECTORS.some(sel => {
+      try { return el.matches(sel); } catch(e) { return false; }
+    });
+
     if (isInteractive && !disabled) {
       const key = addRef(el);
       if (key) ref = '[@' + key + ']';
@@ -166,16 +237,24 @@ SNAPSHOT_JS = r"""
     const prefix = frameIndex !== null ? '[f' + frameIndex + '] ' : '';
 
     if (ref) {
-      lines.push(indent + prefix + ref + ' [' + (role || tag) + '] ' +
-                 (label ? '"' + label.slice(0, 60) + '"' : (text ? '"' + text + '"' : '')));
-    } else if (role && ['dialog', 'alertdialog', 'tooltip', 'menu', 'list', 'tree',
-                         'grid', 'table', 'navigation', 'banner', 'contentinfo',
-                         'main', 'article', 'section'].includes(role)) {
-      lines.push(indent + prefix + '[' + role + '] ' + (label ? '"' + label.slice(0, 60) + '"' : ''));
+      const roleTag = role || tag;
+      const labelStr = label ? '"' + label.slice(0, 60) + '"' : '';
+      const valStr = getValue(el);
+      const valDisplay = valStr ? ' = ' + valStr : '';
+      const typeAttr = tag === 'input' ? (el.getAttribute('type') || 'text') : '';
+      const typeStr = typeAttr ? ' [type=' + typeAttr + ']' : '';
+      const disabledStr = disabled ? ' (disabled)' : '';
+      lines.push(indent + prefix + ref + ' ' + roleTag + typeStr + ' ' +
+                 (labelStr || (text ? '"' + text + '"' : '')) + valDisplay + disabledStr);
+    } else if (isLandmark && depth < 5) {
+      // Report landmarks even if not interactive (structural context)
+      const roleLabel = role || tag;
+      const labelStr = label ? '"' + label.slice(0, 60) + '"' : '';
+      lines.push(indent + prefix + '[' + roleLabel + '] ' + labelStr);
     }
 
     // Process children (limit to reduce noise)
-    const children = Array.from(el.children).filter(c => isVisible(c)).slice(0, 30);
+    const children = Array.from(el.children).filter(c => isVisible(c)).slice(0, 40);
     for (const child of children) {
       describeElement(child, depth + 1, frameIndex);
     }
@@ -183,6 +262,16 @@ SNAPSHOT_JS = r"""
 
   // Main frame
   describeElement(document.body, 0, null);
+
+  // Shadow DOM roots
+  try {
+    const shadowHosts = document.querySelectorAll('*');
+    for (const host of shadowHosts) {
+      if (host.shadowRoot && host.shadowRoot.children.length) {
+        describeElement(host.shadowRoot, 1, null);
+      }
+    }
+  } catch(e) { /* cross-origin shadow roots throw */ }
 
   // Iframes
   const iframes = Array.from(document.querySelectorAll('iframe'));
@@ -194,7 +283,8 @@ SNAPSHOT_JS = r"""
       if (!iframeDoc || !iframeDoc.body) continue;
       describeElement(iframeDoc.body, 1, fi);
     } catch(e) {
-      // Cross-origin iframe — skip
+      // Cross-origin iframe — note but skip
+      lines.push('  [iframe src="' + (iframe.getAttribute('src') || '').slice(0, 60) + '" — cross-origin, skipped]');
     }
   }
 
@@ -237,7 +327,12 @@ def take_snapshot(page: Any, page_id: str, session: Any, full: bool = False, max
     ref_count = result.get("ref_count", 0)
 
     if len(tree_text) > max_length:
-        tree_text = tree_text[:max_length] + f"\n... (truncated, {len(tree_text) - max_length} chars cut)"
+        # Smart truncation: cut at a line boundary
+        truncated = tree_text[:max_length]
+        last_newline = truncated.rfind("\n")
+        if last_newline > max_length * 0.5:
+            truncated = truncated[:last_newline]
+        tree_text = truncated + f"\n... (truncated, {len(tree_text) - max_length} chars cut)"
 
     # Store refs on the session for lookup by resolve_ref
     if hasattr(session, "_ref_map"):
@@ -270,7 +365,6 @@ def resolve_ref(session: Any, page_id: str, ref: str) -> tuple[str, str, int | N
         selector = ref_info.get("selector", f"[role=e{clean_ref}]")
         return clean_ref, selector, None
 
-    # Fallback: try to build something reasonable
     # Check if it's a frame index
     if clean_ref.startswith("f"):
         try:

@@ -1,7 +1,7 @@
-"""Tests for CamoufoxMCP."""
+"""Tests for CamoufoxMCP v0.6.0 — Playwright MCP quality."""
 
 import pytest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 
 class TestBrowserSession:
@@ -38,11 +38,79 @@ class TestBrowserSession:
         session._context = MagicMock()
         session._pages = {"page_abc": MagicMock()}
         session._page_ids = ["page_abc"]
+        session._active_page_id = "page_abc"
+        session._dialogs = {"page_abc": [{"type": "alert", "message": "test"}]}
+        session._console = {"page_abc": [{"type": "log", "text": "hello"}]}
         session._force_cleanup()
         assert session._browser is None
         assert session._context is None
         assert session._pages == {}
         assert session._page_ids == []
+        assert session._active_page_id is None
+        assert session._dialogs == {}
+        assert session._console == {}
+
+    def test_active_page_fallback(self):
+        from camoufoxmcp.session import BrowserSession
+        session = BrowserSession()
+        mock_page1 = MagicMock()
+        mock_page1.is_closed.return_value = False
+        mock_page1.url = "https://example.com"
+        session._pages = {"p1": mock_page1}
+        session._page_ids = ["p1"]
+        assert session.active_page_id == "p1"
+
+    def test_dialog_storage(self):
+        from camoufoxmcp.session import BrowserSession
+        session = BrowserSession()
+        mock_page = MagicMock()
+        mock_page.is_closed.return_value = False
+        session._pages = {"p1": mock_page}
+        session._page_ids = ["p1"]
+        session._dialogs = {"p1": [{"type": "alert", "message": "hello"}]}
+        result = session.get_dialogs("p1")
+        assert result["status"] == "ok"
+        assert result["count"] == 1
+        assert result["dialogs"][0]["message"] == "hello"
+
+    def test_dialog_filter(self):
+        from camoufoxmcp.session import BrowserSession
+        session = BrowserSession()
+        mock_page = MagicMock()
+        mock_page.is_closed.return_value = False
+        session._pages = {"p1": mock_page}
+        session._page_ids = ["p1"]
+        session._dialogs = {"p1": [
+            {"type": "alert", "message": "error 500"},
+            {"type": "confirm", "message": "are you sure?"},
+        ]}
+        result = session.get_dialogs("p1", filter_text="error")
+        assert result["count"] == 1
+        assert "error 500" in result["dialogs"][0]["message"]
+
+    def test_console_storage(self):
+        from camoufoxmcp.session import BrowserSession
+        session = BrowserSession()
+        mock_page = MagicMock()
+        mock_page.is_closed.return_value = False
+        session._pages = {"p1": mock_page}
+        session._page_ids = ["p1"]
+        session._console = {"p1": [{"type": "error", "text": "TypeError: x is undefined"}]}
+        result = session.get_console("p1")
+        assert result["status"] == "ok"
+        assert result["count"] == 1
+
+    def test_console_clear(self):
+        from camoufoxmcp.session import BrowserSession
+        session = BrowserSession()
+        mock_page = MagicMock()
+        mock_page.is_closed.return_value = False
+        session._pages = {"p1": mock_page}
+        session._page_ids = ["p1"]
+        session._console = {"p1": [{"type": "log", "text": "test"}]}
+        result = session.get_console("p1", clear=True)
+        assert result["count"] == 1
+        assert session._console["p1"] == []
 
 
 class TestSnapshot:
@@ -72,10 +140,9 @@ class TestSnapshot:
     def test_resolve_ref_fallback(self):
         from camoufoxmcp.snapshot import resolve_ref
         session = MagicMock()
-        session._ref_map = {}  # No ref map for this page
+        session._ref_map = {}
         clean_ref, selector, _ = resolve_ref(session, "page_unknown", "e99")
         assert clean_ref == "e99"
-        # Falls back to role-based selector
         assert "e99" in selector
 
     def test_resolve_ref_frame_index(self):
@@ -114,21 +181,93 @@ class TestMarkdownExtraction:
         assert "Safe" in result["content"]
         assert "alert" not in result["content"]
 
+    def test_extract_markdown_fallback_when_no_trafilatura(self):
+        from camoufoxmcp.markdown import _extract_markdown_fallback
+        html = "<html><body><h1>Title</h1><p>Paragraph <strong>bold</strong></p></body></html>"
+        text = _extract_markdown_fallback(html)
+        assert "Title" in text
+        assert "Paragraph" in text
+        assert "**bold**" in text
+
+    def test_markdown_links(self):
+        from camoufoxmcp.markdown import _extract_markdown_fallback
+        html = '<html><body><a href="/api">API Docs</a></body></html>'
+        text = _extract_markdown_fallback(html)
+        assert "[API Docs](/api)" in text
+
 
 class TestSnapshotJS:
     """Test the injected snapshot JS logic."""
 
     def test_snapshot_js_is_valid(self):
-        import re
-        # Verify the JS doesn't have obvious syntax errors
         from camoufoxmcp.snapshot import SNAPSHOT_JS
-        # Should have function definitions
         assert "function isVisible" in SNAPSHOT_JS
         assert "function getSelector" in SNAPSHOT_JS
         assert "function getLabel" in SNAPSHOT_JS
         assert "function describeElement" in SNAPSHOT_JS
-        # Should return an object with expected keys (JS uses single-quote keys in the return stmt)
+        assert "function getValue" in SNAPSHOT_JS
         assert "return {" in SNAPSHOT_JS
         assert "tree:" in SNAPSHOT_JS
         assert "refs," in SNAPSHOT_JS
         assert "ref_count:" in SNAPSHOT_JS
+
+    def test_snapshot_covers_more_interactives(self):
+        from camoufoxmcp.snapshot import SNAPSHOT_JS
+        # v0.6.0 additions
+        assert "[onclick]" in SNAPSHOT_JS or 'onclick' in SNAPSHOT_JS
+        assert "[contenteditable" in SNAPSHOT_JS
+        assert "data-qa" in SNAPSHOT_JS  # selector coverage
+        assert "LANDMARK_SELECTORS" in SNAPSHOT_JS
+
+    def test_snapshot_max_refs_increased(self):
+        from camoufoxmcp.snapshot import SNAPSHOT_JS
+        # v0.6.0 bumped from 200 to 300
+        assert "MAX_REFS = 300" in SNAPSHOT_JS
+
+
+class TestCloudflareDetection:
+    """Test CF challenge detection."""
+
+    def test_is_cf_challenge_true_iuam(self):
+        from camoufoxmcp.cloudscraper_bridge import _is_cf_challenge_html
+        assert _is_cf_challenge_html("<html><head><title>Just a moment...</title></head><body></body></html>")
+
+    def test_is_cf_challenge_true_chl_opt(self):
+        from camoufoxmcp.cloudscraper_bridge import _is_cf_challenge_html
+        assert _is_cf_challenge_html(
+            '<html><script>window._cf_chl_opt={cType: "managed"}; challenges.cloudflare.com</script></html>'
+        )
+
+    def test_is_cf_challenge_false_normal(self):
+        from camoufoxmcp.cloudscraper_bridge import _is_cf_challenge_html
+        assert not _is_cf_challenge_html("<html><head><title>My Site</title></head><body>Content</body></html>")
+
+
+class TestServerCreation:
+    """Test server can be created."""
+
+    @patch("camoufoxmcp.server._session")
+    def test_create_server_returns_fastmcp(self, mock_session):
+        from camoufoxmcp.server import create_server
+        mcp = create_server()
+        assert mcp is not None
+        # FastMCP has a name
+        assert hasattr(mcp, "name")
+        assert mcp.name == "camoufox"
+
+    @patch("camoufoxmcp.server._session")
+    def test_resolve_page_no_active(self, mock_session):
+        from camoufoxmcp.server import _resolve_page
+        from camoufoxmcp.session import BrowserSessionError
+        mock_session.active_page_id = None
+        with pytest.raises(BrowserSessionError, match="No active page"):
+            _resolve_page()
+
+    @patch("camoufoxmcp.server._session")
+    def test_resolve_page_explicit(self, mock_session):
+        from camoufoxmcp.server import _resolve_page
+        mock_page = MagicMock()
+        mock_session.get_page.return_value = mock_page
+        page, pid = _resolve_page("my_page_id")
+        assert pid == "my_page_id"
+        mock_session.get_page.assert_called_once_with("my_page_id")
