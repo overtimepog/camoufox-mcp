@@ -1,10 +1,11 @@
 # Camoufox MCP
 
-> Stealth browser automation MCP server powered by [Camoufox](https://github.com/askjoe/camoufox) — a humanized Playwright Firefox fork. **Playwright MCP quality** with two-tier Cloudflare bypass, keyboard input, console capture, tab management, cookies, file upload, and annotated screenshots.
+> Stealth browser automation MCP server powered by [Camoufox](https://github.com/askjoe/camoufox) — a humanized Playwright Firefox fork. **Playwright MCP quality** with two-tier Cloudflare bypass, headed-mode viewport/window alignment, keyboard input, console capture, tab management, cookies, file upload, and annotated screenshots.
 
 ## Features
 
 - **Stealth by default** — randomized viewports, real human mouse/keyboard patterns, spoofed fingerprints
+- **Headed mode that matches what you see** — launch-time Camoufox fingerprint window is aligned with the Playwright viewport so Retina/macOS pages do not render off-screen or look zoomed/clipped
 - **Two-tier Cloudflare bypass** — cloudscraper (fast HTTP) → FlareSolverr (guaranteed, with browser recovery)
 - **Full browser session recovery** — `flaresolverr_solve` sets up Playwright route interception so the entire browser session works through FlareSolverr: navigate, snapshot, click, type — all transparent
 - **Ref-based interaction** — snapshot-first: `[@eN]` refs from accessibility tree with real CSS selectors; click by ref, type by ref
@@ -41,13 +42,14 @@ Tier 2 uses FlareSolverr (Docker-based headless Chromium) to bypass Turnstile, J
 # First Tier 2 call auto-pulls the image and starts the container.
 ```
 
-## Tools (35 total)
+## Tools (36 total)
 
 ### Browser Lifecycle
 
 | Tool | Description |
 |------|-------------|
 | `camoufox_launch` | Start stealth browser (Firefox-based Playwright) |
+| `camoufox_resize_viewport` | Resize viewport; in headed mode, relaunches Camoufox with matching fingerprint window and restores cookies/URLs |
 | `camoufox_close` | Close browser and release all resources |
 
 ### Page / Tab Management
@@ -121,6 +123,25 @@ Tier 2 uses FlareSolverr (Docker-based headless Chromium) to bypass Turnstile, J
 | `camoufox_flaresolverr_stop` | Stop FlareSolverr container |
 | `camoufox_flaresolverr_health` | Check if FlareSolverr is running |
 
+## Headed Mode Viewport Alignment
+
+Camoufox spoofs browser fingerprint values such as `window.innerWidth` and `window.outerWidth`. In headed mode, Camoufox MCP now keeps that spoofed fingerprint window aligned with Playwright's viewport so visually centered pages, OAuth/login screens, and responsive layouts render where the user actually sees them.
+
+```python
+# Launch a comfortable headed browser for manual login / visual QA
+camoufox_launch(
+    display_mode="headed",
+    viewport_width=1280,
+    viewport_height=800,
+)
+
+# Auto-fit to the detected screen on macOS, or pass explicit dimensions
+camoufox_resize_viewport(width=0, height=0)
+camoufox_resize_viewport(width=1440, height=900)
+```
+
+In headed mode, `camoufox_resize_viewport` relaunches Camoufox with a matching fingerprint window and restores cookies, storage state, open page URLs, and the active page id. In headless mode, it performs a normal Playwright viewport resize.
+
 ## Cloudflare Bypass Workflow
 
 When `camoufox_navigate` returns `cloudflare_blocked: true`:
@@ -173,9 +194,9 @@ if result.get("cloudflare_blocked"):
 ```
 camoufox-mcp/
 ├── camoufoxmcp/
-│   ├── __init__.py              # v0.6.0
+│   ├── __init__.py              # v0.6.2
 │   ├── __main__.py              # Entry point
-│   ├── server.py                # FastMCP server + 35 tool definitions
+│   ├── server.py                # FastMCP server + 36 tool definitions
 │   ├── session.py               # BrowserSession: lifecycle, dialogs, console, cookies, tabs
 │   ├── snapshot.py              # Accessibility-tree snapshot + CSS selector ref resolution
 │   ├── markdown.py              # trafilatura + regex fallback markdown extraction

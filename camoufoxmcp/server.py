@@ -19,7 +19,7 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from .session import BrowserSession, SessionConfig, BrowserSessionError, PageNotFoundError, PageClosedError, _random_viewport
+from .session import BrowserSession, SessionConfig, BrowserSessionError, PageNotFoundError, PageClosedError, _random_viewport, _detect_screen_size
 from .snapshot import take_snapshot, resolve_ref
 from .markdown import extract_markdown
 from .vision import take_screenshot
@@ -216,9 +216,14 @@ def create_server(caps: set[str] | None = None):
         if _session.is_running:
             return {"status": "already_running", "pages": _session.list_pages()}
 
-        vp = _random_viewport()
-        w = viewport_width or vp["width"]
-        h = viewport_height or vp["height"]
+        if headless:
+            vp = _random_viewport()
+            w = viewport_width or vp["width"]
+            h = viewport_height or vp["height"]
+        else:
+            detected_w, detected_h = _detect_screen_size()
+            w = viewport_width or detected_w
+            h = viewport_height or detected_h
 
         cfg = SessionConfig(
             headless=headless,

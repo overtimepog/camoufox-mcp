@@ -11,7 +11,7 @@ import logging
 import random
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 logger = logging.getLogger("camoufoxmcp")
@@ -93,6 +93,7 @@ class SessionConfig:
     user_agent: str | None = None
     user_data_dir: str | None = None
     extra_args: list[str] | None = None
+    storage_state: dict[str, Any] | str | None = None
 
 
 class BrowserSession:
@@ -115,6 +116,7 @@ class BrowserSession:
         self._executor: ThreadPoolExecutor | None = None
         self._display_mode: str = "headless"
         self._current_viewport: dict[str, int] | None = None  # tracked so new pages inherit it
+        self._last_config: SessionConfig | None = None
 
         # Per-page dialog and console stores (populated by page event handlers)
         self._dialogs: dict[str, list[dict[str, Any]]] = {}
@@ -209,6 +211,9 @@ class BrowserSession:
                 humanize=cfg.humanize if cfg.humanize is not False else None,
                 locale=cfg.locale,
                 proxy={"server": cfg.proxy} if cfg.proxy else None,
+                window=(cfg.viewport["width"], cfg.viewport["height"])
+                if (not cfg.headless and cfg.viewport)
+                else None,
             )
 
             browser = Camoufox(**opts)
@@ -222,6 +227,7 @@ class BrowserSession:
                     timezone_id=cfg.timezone,
                     color_scheme=cfg.color_scheme,
                     user_agent=cfg.user_agent,
+                    storage_state=cfg.storage_state,  # type: ignore[arg-type]
                 )
             else:
                 ctx = raw
@@ -235,6 +241,7 @@ class BrowserSession:
         self._dialogs = {}
         self._console = {}
         self._current_viewport = dict(cfg.viewport) if cfg.viewport else None
+        self._last_config = replace(cfg)
         logger.info("Camoufox browser launched (headless=%s, viewport=%s)", cfg.headless, self._current_viewport)
 
     async def new_page(self) -> str:
@@ -301,12 +308,127 @@ class BrowserSession:
         logger.info("Viewport resized to %dx%d on %d pages", width, height, count)
         return {"status": "resized", "width": width, "height": height, "pages_affected": count}
 
+    def _relaunch_headed_for_viewport_sync(self, width: int, height: int) -> dict[str, Any]:
+        """Relaunch headed Camoufox so its fingerprint window matches the requested viewport.
+
+        Camoufox freezes window.innerWidth/window.outerWidth from the launch-time
+        fingerprint. Calling page.set_viewport_size() alone resizes screenshots but does
+        not update the spoofed window metrics, which makes JS/CSS-driven layouts render
+        off-screen. A headed resize therefore has to relaunch with a new Camoufox
+        `window=(width, height)` fingerprint and restore cookies + URLs.
+        """
+        if not self._last_config:
+            raise BrowserSessionError("Cannot resize headed browser before launch config is available")
+
+        from camoufox.sync_api import Camoufox
+        from camoufox.utils import launch_options
+        from playwright.sync_api import Browser
+
+        old_pages = []
+        active_old = self._active_page_id
+        for pid in list(self._page_ids):
+            page = self._pages.get(pid)
+            if page and not page.is_closed():
+                url = page.url
+                old_pages.append({"page_id": pid, "url": url, "active": pid == active_old})
+
+        try:
+            storage_state = self._context.storage_state()
+        except Exception:
+            storage_state = None
+
+        try:
+            for page in list(self._context.pages):
+                try:
+                    page.close()
+                except Exception:
+                    pass
+            try:
+                self._context.close()
+            except Exception:
+                pass
+            try:
+                self._browser.__exit__(None, None, None)
+            except Exception:
+                pass
+        finally:
+            self._pages = {}
+            self._page_ids = []
+            self._dialogs = {}
+            self._console = {}
+            self._active_page_id = None
+
+        cfg = replace(
+            self._last_config,
+            viewport={"width": width, "height": height},
+            storage_state=storage_state,
+        )
+
+        opts = launch_options(
+            headless=False,
+            humanize=cfg.humanize if cfg.humanize is not False else None,
+            locale=cfg.locale,
+            proxy={"server": cfg.proxy} if cfg.proxy else None,
+            window=(width, height),
+        )
+        browser = Camoufox(**opts)
+        raw = browser.__enter__()
+        if isinstance(raw, Browser):
+            ctx = raw.new_context(
+                viewport=cfg.viewport,
+                locale=cfg.locale,
+                timezone_id=cfg.timezone,
+                color_scheme=cfg.color_scheme,
+                user_agent=cfg.user_agent,
+                storage_state=cfg.storage_state,  # type: ignore[arg-type]
+            )
+        else:
+            ctx = raw
+
+        self._browser = browser
+        self._context = ctx
+        self._last_config = cfg
+        self._current_viewport = {"width": width, "height": height}
+
+        restored = 0
+        pages_to_restore = old_pages or [{"page_id": f"page_{uuid.uuid4().hex[:8]}", "url": "about:blank", "active": True}]
+        for info in pages_to_restore:
+            page_id = info["page_id"]
+            page = self._context.new_page()
+            self._setup_page_handlers(page, page_id)
+            self._pages[page_id] = page
+            self._page_ids.append(page_id)
+            if info.get("active"):
+                self._active_page_id = page_id
+            url = info.get("url") or "about:blank"
+            if url and url != "about:blank":
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                except Exception:
+                    logger.warning("Failed restoring page %s to %s", page_id, url, exc_info=True)
+            restored += 1
+
+        if not self._active_page_id and self._page_ids:
+            self._active_page_id = self._page_ids[0]
+
+        return {
+            "status": "resized",
+            "width": width,
+            "height": height,
+            "pages_affected": restored,
+            "restarted": True,
+            "hint": "Headed Camoufox was relaunched so spoofed window metrics match the visible viewport.",
+        }
+
     def resize_viewport_sync(self, width: int, height: int) -> dict[str, Any]:
         """Synchronous wrapper — call from within the executor thread."""
         if width == 0 or height == 0:
             w, h = _detect_screen_size()
             width = width or w
             height = height or h
+
+        if self._display_mode == "headed":
+            return self._relaunch_headed_for_viewport_sync(width, height)
 
         self._current_viewport = {"width": width, "height": height}
 

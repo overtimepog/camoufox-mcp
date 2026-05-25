@@ -1,5 +1,8 @@
 """Tests for CamoufoxMCP v0.6.0 — Playwright MCP quality."""
 
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 from unittest.mock import MagicMock, patch
 
@@ -111,6 +114,31 @@ class TestBrowserSession:
         result = session.get_console("p1", clear=True)
         assert result["count"] == 1
         assert session._console["p1"] == []
+
+    def test_headed_launch_passes_viewport_as_camoufox_window(self):
+        """Headed mode must align Camoufox's spoofed window size with Playwright viewport.
+
+        Without this, JS sees the random fingerprint window size (often 2560px wide)
+        while the visible headed window is narrower, causing centered login forms to
+        render off-screen or look zoomed/clipped on macOS Retina displays.
+        """
+        from camoufoxmcp.session import BrowserSession, SessionConfig
+
+        session = BrowserSession()
+        fake_context = MagicMock()
+        fake_manager = MagicMock()
+        fake_manager.__enter__.return_value = fake_context
+
+        with patch("camoufox.sync_api.Camoufox", return_value=fake_manager), \
+             patch("camoufox.utils.launch_options", return_value={}) as mock_launch_options:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                asyncio.run(session.launch(
+                    SessionConfig(headless=False, viewport={"width": 1280, "height": 800}),
+                    executor,
+                ))
+
+        mock_launch_options.assert_called_once()
+        assert mock_launch_options.call_args.kwargs["window"] == (1280, 800)
 
 
 class TestSnapshot:
