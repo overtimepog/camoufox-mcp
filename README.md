@@ -1,6 +1,6 @@
 # Camoufox MCP
 
-> Stealth browser automation MCP server powered by [Camoufox](https://github.com/askjoe/camoufox) — a humanized Playwright Firefox fork. **Playwright MCP quality** with two-tier Cloudflare bypass, headed-mode viewport/window alignment, keyboard input, console capture, tab management, cookies, file upload, and annotated screenshots.
+> Stealth browser automation MCP server powered by [Camoufox](https://github.com/askjoe/camoufox) — a humanized Playwright Firefox fork. **Playwright MCP quality** with two-tier Cloudflare bypass, headed-mode viewport/window alignment, CSS selector + snapshot ref targeting, batch form filling, drag & drop, async JS evaluation, keyboard input, console capture, tab management, cookies, file upload, and annotated screenshots.
 
 ## Features
 
@@ -8,7 +8,10 @@
 - **Headed mode that matches what you see** — launch-time Camoufox fingerprint window is aligned with the Playwright viewport so Retina/macOS pages do not render off-screen or look zoomed/clipped
 - **Two-tier Cloudflare bypass** — cloudscraper (fast HTTP) → FlareSolverr (guaranteed, with browser recovery)
 - **Full browser session recovery** — `flaresolverr_solve` sets up Playwright route interception so the entire browser session works through FlareSolverr: navigate, snapshot, click, type — all transparent
-- **Ref-based interaction** — snapshot-first: `[@eN]` refs from accessibility tree with real CSS selectors; click by ref, type by ref
+- **Ref-based interaction** — snapshot-first: `[@eN]` refs from accessibility tree with real CSS selectors; click by ref, type by ref. **Also accepts raw CSS selectors** for elements not in the snapshot (React portals, popovers, etc.).
+- **Batch form filling** — `camoufox_fill_form` fills multiple fields at once (textbox, checkbox, radio, combobox, slider).
+- **Drag & drop** — `camoufox_drag` moves elements between targets.
+- **Async JavaScript** — `camoufox_evaluate` supports both sync and async expressions with configurable timeout.
 - **Tab management** — open multiple pages, switch between them, close individually
 - **Console capture** — real-time JS errors, warnings, and logs from the page
 - **Auto-managed FlareSolverr** — Tier 2 automatically starts/stops Docker container on demand
@@ -42,7 +45,7 @@ Tier 2 uses FlareSolverr (Docker-based headless Chromium) to bypass Turnstile, J
 # First Tier 2 call auto-pulls the image and starts the container.
 ```
 
-## Tools (36 total)
+## Tools (39 total)
 
 ### Browser Lifecycle
 
@@ -71,15 +74,17 @@ Tier 2 uses FlareSolverr (Docker-based headless Chromium) to bypass Turnstile, J
 
 | Tool | Description |
 |------|-------------|
-| `camoufox_snapshot` | Get interactive elements as `[@eN]` refs with real CSS selectors |
-| `camoufox_click` | Click by ref (supports double-click) |
-| `camoufox_type` | Type text into input by ref |
+| `camoufox_snapshot` | Get interactive elements as `[@eN]` refs with real CSS selectors. Detects React portals / popovers. |
+| `camoufox_click` | Click by ref or raw CSS selector (supports double-click) |
+| `camoufox_type` | Type text into input by ref or raw CSS selector |
+| `camoufox_fill_form` | Batch fill multiple fields at once (textbox, checkbox, radio, combobox, slider) |
+| `camoufox_drag` | Drag one element onto another by ref or CSS selector |
 | `camoufox_press` | Press keyboard key (Enter, Tab, Escape, ArrowDown, etc.) |
-| `camoufox_select` | Select dropdown option by value/label/index |
-| `camoufox_hover` | Hover over element by ref |
+| `camoufox_select` | Select dropdown option by value/label/index. Accepts ref or CSS selector. |
+| `camoufox_hover` | Hover over element by ref or CSS selector |
 | `camoufox_scroll` | Scroll up/down by pixel amount |
-| `camoufox_evaluate` | Execute JavaScript in page context |
-| `camoufox_file_upload` | Upload files to a file input by ref |
+| `camoufox_evaluate` | Execute JavaScript in page context (sync or async, configurable timeout) |
+| `camoufox_file_upload` | Upload files to a file input by ref or CSS selector |
 | `camoufox_wait` | Wait for page to settle (network idle) |
 
 ### Content Extraction
@@ -194,9 +199,9 @@ if result.get("cloudflare_blocked"):
 ```
 camoufox-mcp/
 ├── camoufoxmcp/
-│   ├── __init__.py              # v0.6.2
+│   ├── __init__.py              # v0.7.0
 │   ├── __main__.py              # Entry point
-│   ├── server.py                # FastMCP server + 36 tool definitions
+│   ├── server.py                # FastMCP server + 39 tool definitions
 │   ├── session.py               # BrowserSession: lifecycle, dialogs, console, cookies, tabs
 │   ├── snapshot.py              # Accessibility-tree snapshot + CSS selector ref resolution
 │   ├── markdown.py              # trafilatura + regex fallback markdown extraction

@@ -137,10 +137,19 @@ def create_server(caps: set[str] | None = None):
             "5. camoufox_read_page(page_id) — page as clean markdown\n"
             "6. camoufox_screenshot(page_id) — screenshot (with optional element annotation)\n"
             "7. camoufox_close() — done\n\n"
+            "REF-BASED TOOLS accept [@eN] snapshot refs OR raw CSS selectors.\n"
+            "When an element isn't captured by the snapshot (e.g. inside a React portal\n"
+            "or popover), use a CSS selector directly: 'input[name=\"email\"]', '#submit', etc.\n\n"
+            "BATCH FORM FILLING:\n"
+            "camoufox_fill_form(page_id, fields) — fill multiple form fields in one call\n\n"
+            "DRAG & DROP:\n"
+            "camoufox_drag(page_id, start, end) — drag one element onto another\n\n"
             "KEYBOARD & NAVIGATION:\n"
             "camoufox_press(page_id, key) — press Enter, Tab, Escape, ArrowDown, etc.\n"
             "camoufox_back(page_id) — navigate back in history\n"
             "camoufox_console(page_id) — get browser console messages (JS errors, warnings)\n\n"
+            "JAVASCRIPT:\n"
+            "camoufox_evaluate(page_id, expression, timeout) — run sync or async JS\n\n"
             "TAB MANAGEMENT:\n"
             "camoufox_new_page() — open additional tab\n"
             "camoufox_list_pages() — see all open tabs\n"
@@ -443,13 +452,15 @@ def create_server(caps: set[str] | None = None):
         ref: str,
         double: bool = False,
     ) -> dict[str, Any]:
-        """Click an element by its [@eN] ref ID from camoufox_snapshot.
+        """Click an element by ref from camoufox_snapshot, or by CSS selector.
 
+        Accepts [@eN] snapshot refs, frame refs, or raw CSS selectors
+        (e.g. 'button[data-testid="submit"]', '#login-btn', '.primary-button').
         Auto-retries once if element moved.
 
         Args:
             page_id: Target page ID.
-            ref: Ref from snapshot e.g. '@e5' or 'e5'.
+            ref: Ref from snapshot e.g. '@e5', 'e5', or a CSS selector.
             double: Double-click instead of single click (default: False).
         """
         page = _session.get_page(page_id)
@@ -496,11 +507,14 @@ def create_server(caps: set[str] | None = None):
         clear: bool = True,
         submit: bool = False,
     ) -> dict[str, Any]:
-        """Type text into an input by ref from camoufox_snapshot.
+        """Type text into an input by ref from camoufox_snapshot, or by CSS selector.
+
+        Accepts [@eN] snapshot refs, frame refs, or raw CSS selectors
+        (e.g. 'input[name="email"]', '#password', '.search-input').
 
         Args:
             page_id: Target page ID.
-            ref: Ref from snapshot.
+            ref: Ref from snapshot, or a CSS selector.
             text: Text to type.
             clear: Clear field first (default: True).
             submit: Press Enter after typing (default: False).
@@ -525,6 +539,77 @@ def create_server(caps: set[str] | None = None):
         return await loop.run_in_executor(_executor, _type)
 
     @mcp.tool()
+    async def camoufox_fill_form(
+        page_id: str,
+        fields: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Fill multiple form fields at once.
+
+        Each field is a dict with:
+          - name: Human-readable field name (for logging)
+          - target: Ref from snapshot or CSS selector for the input element
+          - type: 'textbox', 'checkbox', 'radio', 'combobox', or 'slider'
+          - value: Value to fill (string for textbox/combobox/slider, bool for checkbox, string for radio value)
+
+        Args:
+            page_id: Target page ID.
+            fields: List of field dicts, e.g.
+                [{"name": "Email", "target": "input[name='email']", "type": "textbox", "value": "user@example.com"},
+                 {"name": "Agree", "target": "@e15", "type": "checkbox", "value": true}]
+        """
+        page = _session.get_page(page_id)
+        loop = asyncio.get_event_loop()
+
+        def _fill():
+            results = []
+            for f in fields:
+                name = f.get("name", "unnamed")
+                target_raw = f.get("target", "")
+                field_type = f.get("type", "textbox")
+                value = f.get("value")
+
+                if not target_raw:
+                    results.append({"field": name, "status": "error", "error": "No target provided"})
+                    continue
+
+                _, selector, _ = resolve_ref(_session, page_id, target_raw)
+
+                try:
+                    if field_type == "textbox":
+                        page.fill(selector, str(value) if value is not None else "")
+                        results.append({"field": name, "status": "filled", "value": value})
+
+                    elif field_type == "checkbox":
+                        if value:
+                            page.check(selector)
+                        else:
+                            page.uncheck(selector)
+                        results.append({"field": name, "status": "toggled", "checked": bool(value)})
+
+                    elif field_type == "radio":
+                        page.check(selector)
+                        results.append({"field": name, "status": "selected", "value": value})
+
+                    elif field_type == "combobox":
+                        page.select_option(selector, str(value) if value is not None else "")
+                        results.append({"field": name, "status": "selected", "value": value})
+
+                    elif field_type == "slider":
+                        page.fill(selector, str(value) if value is not None else "")
+                        results.append({"field": name, "status": "set", "value": value})
+
+                    else:
+                        results.append({"field": name, "status": "error", "error": f"Unknown type: {field_type}"})
+                except Exception as exc:
+                    results.append({"field": name, "status": "error", "error": str(exc)})
+
+            return {"status": "ok", "filled": len([r for r in results if r["status"] != "error"]),
+                    "errors": len([r for r in results if r["status"] == "error"]),
+                    "fields": results}
+
+        return await loop.run_in_executor(_executor, _fill)
+
+    @mcp.tool()
     async def camoufox_select(
         page_id: str,
         ref: str,
@@ -532,9 +617,10 @@ def create_server(caps: set[str] | None = None):
         label: str | None = None,
         index: int | None = None,
     ) -> dict[str, Any]:
-        """Select a dropdown option by ref.
+        """Select a dropdown option by ref from camoufox_snapshot, or by CSS selector.
 
         Provide exactly one of: value, label, or index.
+        Accepts [@eN] snapshot refs or raw CSS selectors (e.g. 'select[name="country"]').
         """
         page = _session.get_page(page_id)
         clean_ref, selector, frame_idx = resolve_ref(_session, page_id, ref)
@@ -563,7 +649,10 @@ def create_server(caps: set[str] | None = None):
 
     @mcp.tool()
     async def camoufox_hover(page_id: str, ref: str) -> dict[str, Any]:
-        """Hover over an element by ref."""
+        """Hover over an element by ref from camoufox_snapshot, or by CSS selector.
+
+        Accepts [@eN] snapshot refs or raw CSS selectors.
+        """
         page = _session.get_page(page_id)
         clean_ref, selector, frame_idx = resolve_ref(_session, page_id, ref)
         loop = asyncio.get_event_loop()
@@ -578,6 +667,43 @@ def create_server(caps: set[str] | None = None):
             return {"status": "hovered", "ref": f"@{clean_ref}"}
 
         return await loop.run_in_executor(_executor, _hover)
+
+    @mcp.tool()
+    async def camoufox_drag(
+        page_id: str,
+        start: str,
+        end: str,
+    ) -> dict[str, Any]:
+        """Drag an element onto another element.
+
+        Accepts [@eN] snapshot refs or raw CSS selectors for both start and end.
+
+        Args:
+            page_id: Target page ID.
+            start: Ref or CSS selector for the element to drag.
+            end: Ref or CSS selector for the drop target.
+        """
+        page = _session.get_page(page_id)
+        start_clean, start_sel, start_frame = resolve_ref(_session, page_id, start)
+        end_clean, end_sel, end_frame = resolve_ref(_session, page_id, end)
+        loop = asyncio.get_event_loop()
+
+        def _drag():
+            start_target = page
+            if start_frame is not None:
+                frames = page.frames
+                if start_frame < len(frames):
+                    start_target = frames[start_frame]
+            end_target = page
+            if end_frame is not None:
+                frames = page.frames
+                if end_frame < len(frames):
+                    end_target = frames[end_frame]
+
+            start_target.drag_and_drop(start_sel, end_sel)
+            return {"status": "dragged", "from": start_clean, "to": end_clean}
+
+        return await loop.run_in_executor(_executor, _drag)
 
     @mcp.tool()
     async def camoufox_scroll(
@@ -606,29 +732,41 @@ def create_server(caps: set[str] | None = None):
         return await loop.run_in_executor(_executor, _scroll)
 
     @mcp.tool()
-    async def camoufox_evaluate(page_id: str, expression: str) -> dict[str, Any]:
+    async def camoufox_evaluate(
+        page_id: str,
+        expression: str,
+        timeout: int = 30000,
+    ) -> dict[str, Any]:
         """Execute JavaScript in the page context.
+
+        Supports sync and async expressions. Async functions are automatically
+        awaited by Playwright. Use this to read page state, manipulate the DOM,
+        or interact with JavaScript APIs.
 
         Args:
             page_id: Target page ID.
-            expression: JavaScript expression to evaluate.
+            expression: JavaScript expression or async function, e.g.:
+                'document.title'
+                '() => { return { url: location.href, cookies: document.cookie }; }'
+                'async () => { await new Promise(r => setTimeout(r, 1000)); return "done"; }'
+            timeout: Max wait time in ms for async expressions (default: 30000).
         """
         page = _session.get_page(page_id)
         loop = asyncio.get_event_loop()
 
         def _eval():
-            result = page.evaluate(expression)
+            result = page.evaluate(expression, timeout=timeout)
             return {"status": "evaluated", "result": result}
 
         return await loop.run_in_executor(_executor, _eval)
 
     @mcp.tool()
     async def camoufox_file_upload(page_id: str, ref: str, file_paths: str) -> dict[str, Any]:
-        """Upload files to a file input element identified by ref.
+        """Upload files to a file input element identified by ref from camoufox_snapshot, or by CSS selector.
 
         Args:
             page_id: Target page ID.
-            ref: Ref from snapshot pointing to a file input.
+            ref: Ref from snapshot pointing to a file input, or a CSS selector.
             file_paths: Comma-separated absolute file paths to upload.
         """
         page = _session.get_page(page_id)

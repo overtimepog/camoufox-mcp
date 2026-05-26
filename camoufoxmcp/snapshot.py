@@ -263,6 +263,29 @@ SNAPSHOT_JS = r"""
   // Main frame
   describeElement(document.body, 0, null);
 
+  // Portal / popover detection: scan direct body children with high z-index
+  // or fixed/absolute positioning that are likely React portals, modals, or
+  // dropdown menus rendered outside the normal document flow.
+  try {
+    const portalChildren = Array.from(document.body.children).filter(el => {
+      if (!isVisible(el)) return false;
+      const style = getComputedStyle(el);
+      const zIndex = parseInt(style.zIndex) || 0;
+      const pos = style.position;
+      // Heuristic: fixed/absolute with z-index >= 100, or any element with z-index >= 1000
+      return (zIndex >= 100 && (pos === 'fixed' || pos === 'absolute')) || zIndex >= 1000;
+    });
+    if (portalChildren.length > 0) {
+      lines.push('');
+      lines.push('  --- portal / popover ---');
+      for (const portal of portalChildren) {
+        if (refCounter < MAX_REFS) {
+          describeElement(portal, 1, null);
+        }
+      }
+    }
+  } catch(e) { /* portal detection best-effort */ }
+
   // Shadow DOM roots
   try {
     const shadowHosts = document.querySelectorAll('*');
@@ -349,28 +372,38 @@ def take_snapshot(page: Any, page_id: str, session: Any, full: bool = False, max
 
 
 def resolve_ref(session: Any, page_id: str, ref: str) -> tuple[str, str, int | None]:
-    """Resolve a [@eN] ref to a Playwright CSS selector.
+    """Resolve a ref to a Playwright CSS selector.
+
+    Accepts three forms:
+      - [@eN] snapshot ref (e.g. '@e5', 'e12') — looked up from the last snapshot
+      - Frame index ref (e.g. 'f0', 'f1') — targets iframe by index
+      - Raw CSS selector — used directly when the ref doesn't match known patterns
 
     Returns (clean_ref, css_selector, frame_index).
-
-    The CSS selector is a real selector that can be used with page.click(selector),
-    page.fill(selector), etc. via Playwright's locator API.
     """
     clean_ref = ref.lstrip("@")
 
+    # 1. Known snapshot ref: look up the stored selector
     ref_map = getattr(session, "_ref_map", {}).get(page_id, {})
-
     if clean_ref in ref_map:
         ref_info = ref_map[clean_ref]
         selector = ref_info.get("selector", f"[role=e{clean_ref}]")
         return clean_ref, selector, None
 
-    # Check if it's a frame index
+    # 2. Frame index ref
     if clean_ref.startswith("f"):
         try:
             frame_idx = int(clean_ref[1:])
             return clean_ref, f"iframe:nth-of-type({frame_idx + 1})", frame_idx
         except ValueError:
             pass
+
+    # 3. Raw CSS selector fallback — treat the ref string as a CSS selector directly.
+    #    This handles cases where the target element isn't in the snapshot
+    #    (e.g. content inside React portals, popovers, shadow DOM).
+    #    Must look like a CSS selector (contains #. [] or starts with a tag).
+    raw = ref.lstrip("@")
+    if any(c in raw for c in "#.[]") or raw[0].isalpha() or raw.startswith("*"):
+        return raw, raw, None
 
     return clean_ref, f"[role=e{clean_ref}]", None
