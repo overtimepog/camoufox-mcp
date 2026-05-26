@@ -87,7 +87,17 @@ SNAPSHOT_JS = r"""
 
     // 2. name attribute (for inputs/forms)
     if (['input', 'select', 'textarea', 'button', 'form', 'fieldset'].includes(el.tagName.toLowerCase()) && el.name) {
-      return el.tagName.toLowerCase() + '[name="' + el.name.replace(/"/g, '\\"') + '"]';
+      const nameSel = el.tagName.toLowerCase() + '[name="' + el.name.replace(/"/g, '\\"') + '"]';
+      // Check uniqueness — radio/checkbox groups share a name, so disambiguate with value
+      if (document.querySelectorAll(nameSel).length === 1) return nameSel;
+      // For radio/checkbox inputs, combine name + value for a unique selector
+      if (el.hasAttribute('value')) {
+        const valSel = el.tagName.toLowerCase() +
+          '[name="' + el.name.replace(/"/g, '\\"') + '"]' +
+          '[value="' + el.getAttribute('value').replace(/"/g, '\\"') + '"]';
+        if (document.querySelectorAll(valSel).length === 1) return valSel;
+      }
+      // Still ambiguous — annotate with label text as a hint and fall through
     }
 
     // 3. id is unique
@@ -264,10 +274,10 @@ SNAPSHOT_JS = r"""
   describeElement(document.body, 0, null);
 
   // Portal / popover detection: scan direct body children with high z-index
-  // or fixed/absolute positioning that are likely React portals, modals, or
+  // or fixed/absolute positioning that are likely React popovers, modals, or
   // dropdown menus rendered outside the normal document flow.
   try {
-    const portalChildren = Array.from(document.body.children).filter(el => {
+    const popoverChildren = Array.from(document.body.children).filter(el => {
       if (!isVisible(el)) return false;
       const style = getComputedStyle(el);
       const zIndex = parseInt(style.zIndex) || 0;
@@ -275,16 +285,16 @@ SNAPSHOT_JS = r"""
       // Heuristic: fixed/absolute with z-index >= 100, or any element with z-index >= 1000
       return (zIndex >= 100 && (pos === 'fixed' || pos === 'absolute')) || zIndex >= 1000;
     });
-    if (portalChildren.length > 0) {
+    if (popoverChildren.length > 0) {
       lines.push('');
-      lines.push('  --- portal / popover ---');
-      for (const portal of portalChildren) {
+      lines.push('  --- popover / popover ---');
+      for (const popover of popoverChildren) {
         if (refCounter < MAX_REFS) {
-          describeElement(portal, 1, null);
+          describeElement(popover, 1, null);
         }
       }
     }
-  } catch(e) { /* portal detection best-effort */ }
+  } catch(e) { /* popover detection best-effort */ }
 
   // Shadow DOM roots
   try {
@@ -400,7 +410,7 @@ def resolve_ref(session: Any, page_id: str, ref: str) -> tuple[str, str, int | N
 
     # 3. Raw CSS selector fallback — treat the ref string as a CSS selector directly.
     #    This handles cases where the target element isn't in the snapshot
-    #    (e.g. content inside React portals, popovers, shadow DOM).
+    #    (e.g. content inside React popovers, popovers, shadow DOM).
     #    Must look like a CSS selector (contains #. [] or starts with a tag).
     raw = ref.lstrip("@")
     if any(c in raw for c in "#.[]") or raw[0].isalpha() or raw.startswith("*"):

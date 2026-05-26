@@ -755,7 +755,7 @@ def create_server(caps: set[str] | None = None):
         loop = asyncio.get_event_loop()
 
         def _eval():
-            result = page.evaluate(expression, timeout=timeout)
+            result = page.evaluate(expression)
             return {"status": "evaluated", "result": result}
 
         return await loop.run_in_executor(_executor, _eval)
