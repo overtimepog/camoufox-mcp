@@ -287,7 +287,7 @@ SNAPSHOT_JS = r"""
     });
     if (popoverChildren.length > 0) {
       lines.push('');
-      lines.push('  --- popover / popover ---');
+      lines.push('  --- popover ---');
       for (const popover of popoverChildren) {
         if (refCounter < MAX_REFS) {
           describeElement(popover, 1, null);
