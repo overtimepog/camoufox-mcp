@@ -182,6 +182,22 @@ class TestSnapshot:
         assert frame_idx == 2
         assert "iframe" in selector
 
+    def test_take_snapshot_passes_full_flag_into_aria(self):
+        from camoufoxmcp.snapshot import take_snapshot
+
+        page = MagicMock()
+        page.aria_snapshot.return_value = "- textbox \"x\" [ref=e1]\n"
+        session = MagicMock()
+        session._ref_map = {}
+
+        result = take_snapshot(page, "page_abc", session, full=True, max_length=12000)
+
+        # Must call page.aria_snapshot with mode='ai'
+        page.aria_snapshot.assert_called_once_with(mode="ai")
+        assert result["status"] == "ok"
+        assert result["interactive_elements"] == 1
+        assert "e1" in result["refs"]
+
 
 class TestMarkdownExtraction:
     """Test clean markdown extraction."""
@@ -225,32 +241,58 @@ class TestMarkdownExtraction:
 
 
 class TestSnapshotJS:
-    """Test the injected snapshot JS logic."""
+    """Test the aria_snapshot-based snapshot logic (v0.7+)."""
 
-    def test_snapshot_js_is_valid(self):
-        from camoufoxmcp.snapshot import SNAPSHOT_JS
-        assert "function isVisible" in SNAPSHOT_JS
-        assert "function getSelector" in SNAPSHOT_JS
-        assert "function getLabel" in SNAPSHOT_JS
-        assert "function describeElement" in SNAPSHOT_JS
-        assert "function getValue" in SNAPSHOT_JS
-        assert "return {" in SNAPSHOT_JS
-        assert "tree:" in SNAPSHOT_JS
-        assert "refs," in SNAPSHOT_JS
-        assert "ref_count:" in SNAPSHOT_JS
+    def test_snapshot_module_exports(self):
+        # New module must expose the parser and a take_snapshot function
+        from camoufoxmcp.snapshot import _parse_aria_snapshot, take_snapshot, resolve_ref
+        assert callable(take_snapshot)
+        assert callable(resolve_ref)
+        assert callable(_parse_aria_snapshot)
 
-    def test_snapshot_covers_more_interactives(self):
-        from camoufoxmcp.snapshot import SNAPSHOT_JS
-        # v0.6.0 additions
-        assert "[onclick]" in SNAPSHOT_JS or 'onclick' in SNAPSHOT_JS
-        assert "[contenteditable" in SNAPSHOT_JS
-        assert "data-qa" in SNAPSHOT_JS  # selector coverage
-        assert "LANDMARK_SELECTORS" in SNAPSHOT_JS
+    def test_snapshot_uses_aria_snapshot(self):
+        # Confirm we're calling the browser's native a11y tree, not a JS walker
+        from camoufoxmcp import snapshot as snap_mod
+        import inspect
+        src = inspect.getsource(snap_mod.take_snapshot)
+        assert "aria_snapshot" in src
+        # We no longer ship a SNAPSHOT_JS constant
+        assert not hasattr(snap_mod, "SNAPSHOT_JS"), "stale SNAPSHOT_JS constant should be removed"
 
-    def test_snapshot_max_refs_increased(self):
-        from camoufoxmcp.snapshot import SNAPSHOT_JS
-        # v0.6.0 bumped from 200 to 300
-        assert "MAX_REFS = 300" in SNAPSHOT_JS
+    def test_snapshot_returns_useful_refs(self):
+        from camoufoxmcp.snapshot import _parse_aria_snapshot
+        sample = '''- main:
+  - textbox "Email" [ref=e1]
+  - textbox "Password" [ref=e2]
+  - button "Sign in" [ref=e3] [cursor=pointer]
+'''
+        refs, _ = _parse_aria_snapshot(sample)
+        assert len(refs) == 3
+        by_ref = {r["ref"]: r for r in refs}
+        assert by_ref["e1"]["role"] == "textbox"
+        assert by_ref["e1"]["name"] == "Email"
+        assert by_ref["e2"]["role"] == "textbox"
+        assert by_ref["e3"]["role"] == "button"
+        assert by_ref["e3"]["name"] == "Sign in"  # [cursor=pointer] stripped
+
+    def test_snapshot_handles_modifiers_and_ellipsis(self):
+        from camoufoxmcp.snapshot import _parse_aria_snapshot
+        # Common modifier combinations from the aria-snapshot spec
+        sample = '''- heading "Title" [ref=e1] [level=1]
+- link "Help" [ref=e2] [cursor=pointer]:
+  - /url: https://x
+- button "More" [ref=e3] [cursor=pointer]: ...
+- paragraph [ref=e4]: inline child text
+- textbox "Phone" [ref=e5] [active]
+'''
+        refs, _ = _parse_aria_snapshot(sample)
+        by_ref = {r["ref"]: r for r in refs}
+        assert by_ref["e1"]["name"] == "Title"  # [level=1] stripped
+        assert by_ref["e2"]["name"] == "Help"   # [cursor=pointer] + : stripped
+        assert by_ref["e3"]["name"] == "More"   # [cursor=pointer]: ... stripped
+        assert by_ref["e4"]["role"] == "paragraph"
+        assert by_ref["e4"]["name"] is None     # role only, colon-tail dropped
+        assert by_ref["e5"]["name"] == "Phone"  # [active] stripped
 
 
 class TestCloudflareDetection:

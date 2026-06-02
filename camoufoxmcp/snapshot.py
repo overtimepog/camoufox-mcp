@@ -1,14 +1,28 @@
 """Accessibility-tree snapshot with [@eN] ref IDs and CSS selector mapping.
 
-Uses a two-pass approach:
-  1. JS injection: collect interactive DOM elements with their CSS selectors + a11y info
-  2. Build a human-readable tree with @eN refs that map to real selectors
+Uses Playwright's native accessibility tree (page.aria_snapshot with mode='ai'),
+which is the same approach as the official Microsoft Playwright MCP server. This
+is dramatically more reliable than walking the raw DOM because:
 
-Playwright MCP quality improvements:
-  - Wider interactive element coverage (onclick, [contenteditable], form elements, etc.)
-  - Landmark/region detection for page structure
-  - Smarter text extraction for non-interactive containers
-  - Cross-origin iframe handling with graceful fallback
+  - The a11y tree abstracts away pure-presentational <div> wrappers
+  - It surfaces elements by role/name, not by deep DOM position
+  - On sites like Microsoft Entra ID SSO, the form is nested 18+ levels deep
+    in the DOM but the a11y tree flattens it to a top-level textbox
+  - It also handles shadow DOM, ARIA roles, and dynamic content uniformly
+
+How it works:
+  1. page.aria_snapshot(mode='ai') returns a YAML-ish tree with [ref=eN] annotations
+  2. Each ref is a real Playwright selector: page.locator('aria-ref=eN')
+  3. We also extract role + accessible name for display + fallback selector
+  4. resolve_ref() returns 'aria-ref=eN' as the selector — Playwright handles
+     the rest. CSS selectors still work as a fallback for raw selectors.
+
+Why the previous approach was broken:
+  - It walked the visible DOM up to MAX_DEPTH=12
+  - Microsoft Entra ID's login form nests 18+ levels deep (provide-min-height
+    pattern collapses the form's height to 1px until JS measures it)
+  - Result: snapshot returned only 3 footer refs, missing the entire login form
+  - This was the exact bug the user hit on the PSU Canvas SSO page
 """
 
 from __future__ import annotations
@@ -17,355 +31,190 @@ import re
 from typing import Any
 
 
-SNAPSHOT_JS = r"""
-(() => {
-  const MAX_DEPTH = 12;
-  const TEXT_LIMIT = 50;
-  const MAX_REFS = 300;
+# Maps an aria role to the most common Playwright get_by_role invocation.
+# When an aria-ref fails to resolve (a11y tree hasn't been populated, or the
+# element was destroyed by a navigation), we fall back to get_by_role.
+ROLE_RE = re.compile(r"^\s*[-*]\s*(\w+)")
 
-  // Interactive element selectors — comprehensive coverage matching Playwright a11y + DOM
-  const INTERACTIVE_SELECTORS = [
-    // Native interactive elements
-    'a[href]', 'a:not([href])',  // links (even empty href — they might be JS-driven)
-    'button', 'input', 'select', 'textarea', 'datalist', 'optgroup', 'option',
-    'fieldset', 'legend', 'label',
-    // ARIA roles
-    '[role="button"]', '[role="link"]', '[role="checkbox"]', '[role="radio"]',
-    '[role="tab"]', '[role="menuitem"]', '[role="switch"]', '[role="combobox"]',
-    '[role="slider"]', '[role="spinbutton"]', '[role="textbox"]', '[role="searchbox"]',
-    '[role="listbox"]', '[role="option"]', '[role="menuitemcheckbox"]', '[role="menuitemradio"]',
-    '[role="treeitem"]', '[role="tree"]', '[role="grid"]', '[role="row"]',
-    '[role="gridcell"]', '[role="columnheader"]', '[role="rowheader"]',
-    '[role="separator"]', '[role="scrollbar"]',
-    // Focusable
-    '[tabindex]:not([tabindex="-1"])',
-    // Editable
-    '[contenteditable="true"]', '[contenteditable=""]',
-    // Expandable
-    'summary', 'details',
-    // Event-driven (onclick and friends — heuristic for JS-driven interactivity)
-    '[onclick]', '[ondblclick]', '[onmousedown]', '[onmouseup]',
-    '[onsubmit]', '[onreset]', '[onchange]', '[oninput]',
-    '[onkeydown]', '[onkeyup]', '[onkeypress]',
-    // Form-associated
-    'datalist', 'output', 'meter', 'progress',
-  ];
 
-  // Landmark/region roles — structural elements worth reporting even if non-interactive
-  const LANDMARK_SELECTORS = [
-    '[role="navigation"]', '[role="banner"]', '[role="contentinfo"]',
-    '[role="main"]', '[role="complementary"]', '[role="form"]',
-    '[role="search"]', '[role="region"]', '[role="application"]',
-    '[role="dialog"]', '[role="alertdialog"]', '[role="alert"]',
-    '[role="log"]', '[role="status"]', '[role="timer"]',
-    '[role="tooltip"]', '[role="menu"]', '[role="menubar"]',
-    'nav', 'header', 'footer', 'main', 'aside', 'section', 'article',
-  ];
+def _parse_aria_snapshot(snap_text: str) -> tuple[list[dict[str, Any]], list[str]]:
+    """Parse the YAML output of page.aria_snapshot(mode='ai') into refs + tree lines.
 
-  // Visibility check
-  function isVisible(el) {
-    if (!el || el.nodeType !== 1) return false;
-    const style = getComputedStyle(el);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-    if (el.hasAttribute('hidden') && !el.matches('dialog[open]')) return false;
-    const rect = el.getBoundingClientRect();
-    if (rect.width === 0 && rect.height === 0) return false;
-    return true;
-  }
+    Returns (refs, tree_lines). refs is a list of dicts with:
+      - ref: e.g. "e29"
+      - role: e.g. "textbox"
+      - name: accessible name (or None)
+      - raw: original line (trimmed)
+      - line_text: formatted tree line to show in the snapshot
+    tree_lines preserves the YAML structure (including generic / non-ref nodes
+    that provide useful structural context).
+    """
+    refs: list[dict[str, Any]] = []
+    tree_lines: list[str] = []
 
-  // Generate a robust CSS selector for an element
-  function getSelector(el) {
-    if (!el || el === document.body || el === document.documentElement) return 'body';
+    for raw_line in snap_text.splitlines():
+        # Compute indent from leading whitespace
+        stripped = raw_line.lstrip()
+        indent_depth = (len(raw_line) - len(stripped)) // 2
+        # Bullet check
+        if not stripped.startswith("- "):
+            tree_lines.append(raw_line)
+            continue
+        body_full = stripped[2:]
 
-    // 1. data-testid / data-test-id takes priority
-    for (const attr of ['data-testid', 'data-test-id', 'data-cy', 'data-e2e', 'data-qa']) {
-      if (el.hasAttribute(attr)) {
-        return el.tagName.toLowerCase() + '[' + attr + '="' +
-          el.getAttribute(attr).replace(/"/g, '\\"') + '"]';
-      }
-    }
+        # Find the ref token (if any)
+        ref_m = re.search(r"\[ref=(e\d+)\]", body_full)
+        ref_id = ref_m.group(1) if ref_m else None
 
-    // 2. name attribute (for inputs/forms)
-    if (['input', 'select', 'textarea', 'button', 'form', 'fieldset'].includes(el.tagName.toLowerCase()) && el.name) {
-      const nameSel = el.tagName.toLowerCase() + '[name="' + el.name.replace(/"/g, '\\"') + '"]';
-      // Check uniqueness — radio/checkbox groups share a name, so disambiguate with value
-      if (document.querySelectorAll(nameSel).length === 1) return nameSel;
-      // For radio/checkbox inputs, combine name + value for a unique selector
-      if (el.hasAttribute('value')) {
-        const valSel = el.tagName.toLowerCase() +
-          '[name="' + el.name.replace(/"/g, '\\"') + '"]' +
-          '[value="' + el.getAttribute('value').replace(/"/g, '\\"') + '"]';
-        if (document.querySelectorAll(valSel).length === 1) return valSel;
-      }
-      // Still ambiguous — annotate with label text as a hint and fall through
-    }
+        # Strip the ref token
+        body = re.sub(r"\[ref=e\d+\]", "", body_full)
+        # Strip trailing modifier + colon + "..." combination.
+        # Real-world examples this must handle:
+        #   'link "X" [ref=eN] [cursor=pointer]:'            -> 'link "X"'
+        #   'button "Y" [ref=eN] [cursor=pointer]: ...'      -> 'button "Y"'
+        #   'paragraph "Z" [ref=eN]: Some inline text'        -> 'paragraph "Z"'
+        #   'heading "W" [ref=eN] [level=1]'                  -> 'heading "W"'
+        # The colon + optional ellipsis can appear with or without intervening modifiers.
+        body = re.sub(r"\s*\[(?:[^\]]+)\]\s*:?\s*\.{0,3}\s*$", "", body).strip()
+        # Second pass for chains of modifiers
+        body = re.sub(r"\s*(?:\[[^\]]+\]\s*)+:?\s*\.{0,3}\s*$", "", body).strip()
+        # Final fallback: any trailing colon (YAML child introducer)
+        body = re.sub(r"\s*:\s*\.{0,3}\s*$", "", body).strip()
+        # If the line still has a ": <text>" tail (e.g. inline child text after role+name),
+        # drop the tail — it's a child element, not the accessible name
+        if ":" in body:
+            m_role_name = re.match(r"(\w+)\s+[\"\'](.+?)[\"\']\s*:", body)
+            if m_role_name:
+                body = f'{m_role_name.group(1)} "{m_role_name.group(2)}"'
+            else:
+                # No name in quotes — strip everything after the role
+                m_role_only = re.match(r"(\w+)\s*:", body)
+                if m_role_only:
+                    body = m_role_only.group(1)
+        # Strip "..." truncation one more time (safety)
+        body = re.sub(r"\s*\.{3}\s*$", "", body).strip()
 
-    // 3. id is unique
-    if (el.id) {
-      const sel = '#' + CSS.escape(el.id);
-      if (document.querySelectorAll(sel).length === 1) return sel;
-    }
+        # Parse "role \"name\"" or "role" alone
+        m2 = re.match(r"(\w+)\s+[\"'](.+?)[\"']\s*$", body)
+        if m2:
+            role, name = m2.group(1), m2.group(2)
+        else:
+            m3 = re.match(r"(\w+)\s*$", body)
+            if m3:
+                role, name = m3.group(1), None
+            else:
+                role, name = body, None
 
-    // 4. aria-label unique enough?
-    if (el.getAttribute('aria-label')) {
-      const escaped = el.getAttribute('aria-label').replace(/"/g, '\\"');
-      const sel = el.tagName.toLowerCase() + '[aria-label="' + escaped + '"]';
-      if (document.querySelectorAll(sel).length <= 3) return sel;
-    }
+        # Build a friendly tree line
+        prefix = "  " * indent_depth + "- "
+        if name:
+            ref_tag = f" [@{ref_id}]" if ref_id else ""
+            line = f"{prefix}{role} \"{name}\"{ref_tag}"
+        else:
+            ref_tag = f" [@{ref_id}]" if ref_id else ""
+            line = f"{prefix}{role}{ref_tag}"
+        tree_lines.append(line)
 
-    // 5. Build path with classes and nth-of-type
-    const parts = [];
-    let cur = el;
-    for (let i = 0; i < 5 && cur && cur !== document.body && cur !== document.documentElement; i++) {
-      let seg = cur.tagName.toLowerCase();
-      if (cur.id) {
-        seg = '#' + CSS.escape(cur.id);
-        parts.unshift(seg);
-        break;
-      }
-      const cls = Array.from(cur.classList)
-        .slice(0, 2)
-        .map(c => '.' + CSS.escape(c))
-        .join('');
-      if (cls) seg += cls;
-      const parent = cur.parentElement;
-      if (parent) {
-        const siblings = Array.from(parent.children)
-          .filter(c => c.tagName === cur.tagName && isVisible(c));
-        if (siblings.length > 1) {
-          const idx = siblings.indexOf(cur) + 1;
-          seg += ':nth-of-type(' + idx + ')';
-        }
-      }
-      parts.unshift(seg);
-      cur = parent;
-    }
-    return parts.join(' > ') || ('body > ' + el.tagName.toLowerCase());
-  }
+        if ref_id:
+            refs.append({
+                "ref": ref_id,
+                "role": role,
+                "name": name,
+                "raw": body,
+                "line_text": line.strip(),
+            })
 
-  // Get label/description for an element
-  function getLabel(el) {
-    if (el.getAttribute('aria-label')) return el.getAttribute('aria-label').trim();
-    if (el.getAttribute('aria-labelledby')) {
-      const ids = el.getAttribute('aria-labelledby').trim().split(/\s+/);
-      const texts = ids.map(id => {
-        const ref = document.getElementById(id);
-        return ref ? ref.textContent.trim() : '';
-      }).filter(Boolean);
-      if (texts.length) return texts.join(' ');
-    }
-    if (el.id) {
-      const label = document.querySelector('label[for="' + CSS.escape(el.id) + '"]');
-      if (label) return label.textContent.trim();
-    }
-    const parentLabel = el.closest('label');
-    if (parentLabel) {
-      const clone = parentLabel.cloneNode(true);
-      clone.querySelectorAll('input,select,textarea,button').forEach(i => i.remove());
-      const text = clone.textContent.trim();
-      if (text) return text;
-    }
-    // For links/buttons: use their own visible text as label if short
-    if (['a', 'button'].includes(el.tagName.toLowerCase())) {
-      const ownText = (el.textContent || '').replace(/\s+/g, ' ').trim();
-      if (ownText.length <= 80) return ownText;
-    }
-    if (el.getAttribute('title')) return el.getAttribute('title').trim();
-    if (el.getAttribute('placeholder')) return el.getAttribute('placeholder').trim();
-    return '';
-  }
-
-  // Get input value preview
-  function getValue(el) {
-    const tag = el.tagName.toLowerCase();
-    if (tag === 'input') {
-      const type = (el.getAttribute('type') || 'text').toLowerCase();
-      if (['checkbox', 'radio'].includes(type)) return el.checked ? '✓ checked' : '☐ unchecked';
-      if (type === 'file') return el.files && el.files.length ? el.files.length + ' file(s)' : '';
-      if (['hidden', 'image', 'button', 'submit', 'reset'].includes(type)) return '';
-      return el.value || '(empty)';
-    }
-    if (tag === 'select') {
-      const opts = el.selectedOptions;
-      if (opts && opts.length) return Array.from(opts).map(o => o.text).join(', ');
-      return '(none selected)';
-    }
-    if (tag === 'textarea') return el.value ? '"' + el.value.trim().slice(0, 40) + '"' : '(empty)';
-    return '';
-  }
-
-  // Collect all interactive elements with their refs and selectors
-  const refs = {};
-  let refCounter = 0;
-
-  function addRef(el) {
-    if (refCounter >= MAX_REFS) return null;
-    refCounter++;
-    const key = 'e' + refCounter;
-    refs[key] = {
-      selector: getSelector(el),
-      tag: el.tagName.toLowerCase(),
-      role: el.getAttribute('role') || '',
-      label: getLabel(el),
-      value: getValue(el),
-    };
-    return key;
-  }
-
-  // Build tree lines
-  const lines = [];
-
-  function describeElement(el, depth, frameIndex) {
-    if (depth > MAX_DEPTH) return;
-    if (!el || el.nodeType !== 1) return;
-    if (!isVisible(el)) return;
-
-    const tag = el.tagName.toLowerCase();
-    if (['script', 'style', 'noscript', 'template', 'svg', 'path',
-         'link', 'meta', 'head', 'br', 'hr'].includes(tag)) return;
-
-    const role = el.getAttribute('role') || '';
-    const disabled = el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true';
-    const label = getLabel(el);
-    const text = (el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, TEXT_LIMIT);
-
-    let ref = '';
-    const isInteractive = INTERACTIVE_SELECTORS.some(sel => {
-      try { return el.matches(sel); } catch(e) { return false; }
-    });
-
-    const isLandmark = !isInteractive && LANDMARK_SELECTORS.some(sel => {
-      try { return el.matches(sel); } catch(e) { return false; }
-    });
-
-    if (isInteractive && !disabled) {
-      const key = addRef(el);
-      if (key) ref = '[@' + key + ']';
-    }
-
-    const indent = '  '.repeat(Math.min(depth, MAX_DEPTH));
-    const prefix = frameIndex !== null ? '[f' + frameIndex + '] ' : '';
-
-    if (ref) {
-      const roleTag = role || tag;
-      const labelStr = label ? '"' + label.slice(0, 60) + '"' : '';
-      const valStr = getValue(el);
-      const valDisplay = valStr ? ' = ' + valStr : '';
-      const typeAttr = tag === 'input' ? (el.getAttribute('type') || 'text') : '';
-      const typeStr = typeAttr ? ' [type=' + typeAttr + ']' : '';
-      const disabledStr = disabled ? ' (disabled)' : '';
-      lines.push(indent + prefix + ref + ' ' + roleTag + typeStr + ' ' +
-                 (labelStr || (text ? '"' + text + '"' : '')) + valDisplay + disabledStr);
-    } else if (isLandmark && depth < 5) {
-      // Report landmarks even if not interactive (structural context)
-      const roleLabel = role || tag;
-      const labelStr = label ? '"' + label.slice(0, 60) + '"' : '';
-      lines.push(indent + prefix + '[' + roleLabel + '] ' + labelStr);
-    }
-
-    // Process children (limit to reduce noise)
-    const children = Array.from(el.children).filter(c => isVisible(c)).slice(0, 40);
-    for (const child of children) {
-      describeElement(child, depth + 1, frameIndex);
-    }
-  }
-
-  // Main frame
-  describeElement(document.body, 0, null);
-
-  // Portal / popover detection: scan direct body children with high z-index
-  // or fixed/absolute positioning that are likely React popovers, modals, or
-  // dropdown menus rendered outside the normal document flow.
-  try {
-    const popoverChildren = Array.from(document.body.children).filter(el => {
-      if (!isVisible(el)) return false;
-      const style = getComputedStyle(el);
-      const zIndex = parseInt(style.zIndex) || 0;
-      const pos = style.position;
-      // Heuristic: fixed/absolute with z-index >= 100, or any element with z-index >= 1000
-      return (zIndex >= 100 && (pos === 'fixed' || pos === 'absolute')) || zIndex >= 1000;
-    });
-    if (popoverChildren.length > 0) {
-      lines.push('');
-      lines.push('  --- popover ---');
-      for (const popover of popoverChildren) {
-        if (refCounter < MAX_REFS) {
-          describeElement(popover, 1, null);
-        }
-      }
-    }
-  } catch(e) { /* popover detection best-effort */ }
-
-  // Shadow DOM roots
-  try {
-    const shadowHosts = document.querySelectorAll('*');
-    for (const host of shadowHosts) {
-      if (host.shadowRoot && host.shadowRoot.children.length) {
-        describeElement(host.shadowRoot, 1, null);
-      }
-    }
-  } catch(e) { /* cross-origin shadow roots throw */ }
-
-  // Iframes
-  const iframes = Array.from(document.querySelectorAll('iframe'));
-  for (let fi = 0; fi < iframes.length; fi++) {
-    const iframe = iframes[fi];
-    try {
-      if (!isVisible(iframe)) continue;
-      const iframeDoc = iframe.contentDocument || iframe.contentWindow?.document;
-      if (!iframeDoc || !iframeDoc.body) continue;
-      describeElement(iframeDoc.body, 1, fi);
-    } catch(e) {
-      // Cross-origin iframe — note but skip
-      lines.push('  [iframe src="' + (iframe.getAttribute('src') || '').slice(0, 60) + '" — cross-origin, skipped]');
-    }
-  }
-
-  return { tree: lines.join('\n'), refs, ref_count: refCounter };
-})()
-"""
+    return refs, tree_lines
 
 
 def take_snapshot(page: Any, page_id: str, session: Any, full: bool = False, max_length: int = 12000) -> dict[str, Any]:
-    """Capture accessibility tree with real CSS selectors per ref.
+    """Capture accessibility tree using Playwright's native aria snapshot.
+
+    The aria snapshot (mode='ai') is what the official Playwright MCP server uses.
+    It returns refs that are valid Playwright selectors: page.locator('aria-ref=eN').
+
+    IMPORTANT: Calling aria_snapshot() ALSO populates the a11y tree in the page,
+    which is required for aria-ref selectors to resolve. This is why refs work
+    after a snapshot but fail if you try them cold.
+
+    Args:
+        page: Playwright page object
+        page_id: For storing the ref map on the session
+        session: BrowserSession (holds _ref_map)
+        full: Include surrounding structural nodes (default: False, refs only)
+        max_length: Max characters in returned snapshot
 
     Returns:
         {
             "status": "ok",
-            "snapshot": "...",
+            "snapshot": "tree text",
             "interactive_elements": N,
-            "refs": {ref_id: {"selector": "...", "tag": "...", "role": "...", "label": "..."}},
+            "refs": {ref_id: {"selector": "aria-ref=eN", "tag": "button", "role": "button", "label": "Next"}},
         }
     """
     try:
-        result = page.evaluate(SNAPSHOT_JS)
+        snap_text = page.aria_snapshot(mode="ai")
     except Exception as exc:
         return {
             "status": "error",
-            "snapshot": f"(snapshot JS failed: {exc})",
+            "snapshot": f"(aria_snapshot failed: {exc})",
             "interactive_elements": 0,
             "refs": {},
         }
 
-    if not result:
+    if not snap_text:
         return {
             "status": "ok",
-            "snapshot": "(no snapshot result — page may still be loading)",
+            "snapshot": "(empty page — no accessibility nodes)",
             "interactive_elements": 0,
             "refs": {},
         }
 
-    tree_text = result.get("tree", "")
-    refs_data = result.get("refs", {})
-    ref_count = result.get("ref_count", 0)
+    refs, tree_lines = _parse_aria_snapshot(snap_text)
 
+    # When full=False, trim to a more compact view that still shows all refs
+    # (the YAML structure with [ref=eN] is already compact; we just need to
+    # make sure non-ref generic wrappers don't bloat the output)
+    if not full:
+        # Keep only lines that contain a ref OR are a structural landmark
+        # (main, contentinfo, navigation, banner, alert, dialog)
+        structural_roles = ("main", "navigation", "contentinfo", "banner",
+                            "alert", "dialog", "alertdialog", "complementary",
+                            "search", "form", "region", "log", "status")
+        compact = []
+        for line in tree_lines:
+            stripped = line.strip()
+            if "[@e" in stripped or stripped.startswith("- "):
+                # Check if it's a structural landmark
+                m_role = re.match(r"-\s*(\w+)", stripped)
+                if m_role and m_role.group(1) in structural_roles:
+                    compact.append(line)
+                elif "[@e" in stripped:
+                    compact.append(line)
+                # Skip - generic and other pure-container roles
+        tree_lines = compact if compact else tree_lines
+
+    tree_text = "\n".join(tree_lines)
+
+    # Truncate intelligently if too long
     if len(tree_text) > max_length:
-        # Smart truncation: cut at a line boundary
         truncated = tree_text[:max_length]
         last_newline = truncated.rfind("\n")
         if last_newline > max_length * 0.5:
             truncated = truncated[:last_newline]
         tree_text = truncated + f"\n... (truncated, {len(tree_text) - max_length} chars cut)"
+
+    # Build the refs dict for the session. Each ref maps to its aria-ref selector
+    # AND its normalized form (for the LLM to use as a stable CSS-style hint).
+    refs_data: dict[str, dict[str, Any]] = {}
+    for r in refs:
+        refs_data[r["ref"]] = {
+            "selector": f"aria-ref={r['ref']}",  # Playwright native selector
+            "tag": r["role"],
+            "role": r["role"],
+            "label": r["name"] or "",
+            "value": "",
+        }
 
     # Store refs on the session for lookup by resolve_ref
     if hasattr(session, "_ref_map"):
@@ -376,13 +225,13 @@ def take_snapshot(page: Any, page_id: str, session: Any, full: bool = False, max
     return {
         "status": "ok",
         "snapshot": tree_text,
-        "interactive_elements": ref_count,
+        "interactive_elements": len(refs),
         "refs": refs_data,
     }
 
 
 def resolve_ref(session: Any, page_id: str, ref: str) -> tuple[str, str, int | None]:
-    """Resolve a ref to a Playwright CSS selector.
+    """Resolve a ref to a Playwright selector.
 
     Accepts three forms:
       - [@eN] snapshot ref (e.g. '@e5', 'e12') — looked up from the last snapshot
@@ -390,6 +239,10 @@ def resolve_ref(session: Any, page_id: str, ref: str) -> tuple[str, str, int | N
       - Raw CSS selector — used directly when the ref doesn't match known patterns
 
     Returns (clean_ref, css_selector, frame_index).
+
+    For aria refs, the selector is "aria-ref=eN" which Playwright resolves
+    natively. We also try to produce a normalized fallback selector that the
+    LLM can read for debugging.
     """
     clean_ref = ref.lstrip("@")
 
@@ -397,7 +250,7 @@ def resolve_ref(session: Any, page_id: str, ref: str) -> tuple[str, str, int | N
     ref_map = getattr(session, "_ref_map", {}).get(page_id, {})
     if clean_ref in ref_map:
         ref_info = ref_map[clean_ref]
-        selector = ref_info.get("selector", f"[role=e{clean_ref}]")
+        selector = ref_info.get("selector", f"aria-ref={clean_ref}")
         return clean_ref, selector, None
 
     # 2. Frame index ref
@@ -409,11 +262,12 @@ def resolve_ref(session: Any, page_id: str, ref: str) -> tuple[str, str, int | N
             pass
 
     # 3. Raw CSS selector fallback — treat the ref string as a CSS selector directly.
-    #    This handles cases where the target element isn't in the snapshot
+    #    Handles cases where the target element isn't in the snapshot
     #    (e.g. content inside React popovers, popovers, shadow DOM).
     #    Must look like a CSS selector (contains #. [] or starts with a tag).
     raw = ref.lstrip("@")
     if any(c in raw for c in "#.[]") or raw[0].isalpha() or raw.startswith("*"):
         return raw, raw, None
 
-    return clean_ref, f"[role=e{clean_ref}]", None
+    # Last resort: return as-is so Playwright can surface the error
+    return clean_ref, f"aria-ref={clean_ref}", None
