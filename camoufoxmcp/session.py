@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import random
+import shutil
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger("camoufoxmcp")
@@ -76,6 +79,38 @@ class PageNotFoundError(KeyError):
 
 class PageClosedError(BrowserSessionError):
     """Raised when a page exists in tracking but is actually closed/crashed."""
+
+
+def _ensure_macos_properties_json() -> None:
+    """Work around Camoufox macOS bundle layout drift.
+
+    Camoufox v135.0.1-beta.24 stores ``properties.json`` in
+    ``Contents/Resources``. Some launcher paths look for it next to the
+    executable in ``Contents/MacOS`` and fail before Playwright can start:
+
+        No such file or directory: .../Contents/MacOS/properties.json
+
+    Keep the workaround local and idempotent. Prefer a symlink so future
+    Camoufox fetches update the canonical Resources copy; fall back to copying
+    on filesystems that do not allow symlinks.
+    """
+    if os.name != "posix":
+        return
+    try:
+        from camoufox.pkgman import camoufox_path
+
+        bundle = Path(camoufox_path()) / "Camoufox.app" / "Contents"
+        resources = bundle / "Resources" / "properties.json"
+        macos = bundle / "MacOS" / "properties.json"
+        if not resources.exists() or macos.exists():
+            return
+        macos.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            macos.symlink_to(resources)
+        except OSError:
+            shutil.copy2(resources, macos)
+    except Exception:
+        logger.debug("Unable to prepare Camoufox macOS properties.json workaround", exc_info=True)
 
 
 @dataclass
@@ -206,6 +241,8 @@ class BrowserSession:
             from camoufox.sync_api import Camoufox
             from camoufox.utils import launch_options
 
+            _ensure_macos_properties_json()
+
             opts = launch_options(
                 headless=cfg.headless,
                 humanize=cfg.humanize if cfg.humanize is not False else None,
@@ -216,7 +253,14 @@ class BrowserSession:
                 else None,
             )
 
-            browser = Camoufox(**opts)
+            if cfg.user_data_dir:
+                Path(cfg.user_data_dir).mkdir(parents=True, exist_ok=True)
+                opts["user_data_dir"] = cfg.user_data_dir
+
+            browser = Camoufox(
+                from_options=opts,
+                persistent_context=bool(cfg.user_data_dir),
+            )
             raw = browser.__enter__()
 
             from playwright.sync_api import Browser
@@ -324,6 +368,8 @@ class BrowserSession:
         from camoufox.utils import launch_options
         from playwright.sync_api import Browser
 
+        _ensure_macos_properties_json()
+
         old_pages = []
         active_old = self._active_page_id
         for pid in list(self._page_ids):
@@ -371,7 +417,13 @@ class BrowserSession:
             proxy={"server": cfg.proxy} if cfg.proxy else None,
             window=(width, height),
         )
-        browser = Camoufox(**opts)
+        if cfg.user_data_dir:
+            Path(cfg.user_data_dir).mkdir(parents=True, exist_ok=True)
+            opts["user_data_dir"] = cfg.user_data_dir
+        browser = Camoufox(
+            from_options=opts,
+            persistent_context=bool(cfg.user_data_dir),
+        )
         raw = browser.__enter__()
         if isinstance(raw, Browser):
             ctx = raw.new_context(

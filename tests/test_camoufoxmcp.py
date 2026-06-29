@@ -140,6 +140,51 @@ class TestBrowserSession:
         mock_launch_options.assert_called_once()
         assert mock_launch_options.call_args.kwargs["window"] == (1280, 800)
 
+    def test_launch_uses_persistent_context_for_user_data_dir(self, tmp_path):
+        """user_data_dir must use Camoufox persistent_context, not BrowserType.launch()."""
+        from camoufoxmcp.session import BrowserSession, SessionConfig
+
+        session = BrowserSession()
+        fake_context = MagicMock()
+        fake_manager = MagicMock()
+        fake_manager.__enter__.return_value = fake_context
+        profile = tmp_path / "profile"
+
+        with patch("camoufox.sync_api.Camoufox", return_value=fake_manager) as mock_camoufox, \
+             patch("camoufox.utils.launch_options", return_value={}) as mock_launch_options:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                asyncio.run(session.launch(
+                    SessionConfig(
+                        headless=False,
+                        viewport={"width": 1280, "height": 800},
+                        user_data_dir=str(profile),
+                    ),
+                    executor,
+                ))
+
+        assert profile.exists()
+        mock_launch_options.assert_called_once()
+        mock_camoufox.assert_called_once()
+        kwargs = mock_camoufox.call_args.kwargs
+        assert kwargs["persistent_context"] is True
+        assert kwargs["from_options"]["user_data_dir"] == str(profile)
+
+    def test_macos_properties_workaround_links_resource_file(self, tmp_path):
+        """Camoufox macOS Resources/properties.json is exposed at MacOS/properties.json."""
+        from camoufoxmcp import session as session_mod
+
+        root = tmp_path / "camoufox"
+        resources = root / "Camoufox.app" / "Contents" / "Resources"
+        resources.mkdir(parents=True)
+        (resources / "properties.json").write_text('{"ok": true}')
+
+        with patch("camoufox.pkgman.camoufox_path", return_value=root):
+            session_mod._ensure_macos_properties_json()
+
+        macos_properties = root / "Camoufox.app" / "Contents" / "MacOS" / "properties.json"
+        assert macos_properties.exists()
+        assert macos_properties.read_text() == '{"ok": true}'
+
 
 class TestSnapshot:
     """Test snapshot and ref resolution."""
