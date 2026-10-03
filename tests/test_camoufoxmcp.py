@@ -442,3 +442,417 @@ class TestViewport:
         assert result["width"] > 0
         assert result["height"] > 0
         assert session._current_viewport is not None
+
+
+class TestHeaderScopeMatching:
+    """host_in_scope — the boundary that decides who sees your header."""
+
+    def test_exact_host_matches(self):
+        from camoufoxmcp.session import host_in_scope
+        assert host_in_scope("example.com", ["example.com"])
+
+    def test_subdomain_matches(self):
+        from camoufoxmcp.session import host_in_scope
+        assert host_in_scope("www.example.com", ["example.com"])
+        assert host_in_scope("a.b.example.com", ["example.com"])
+
+    def test_leading_dot_is_accepted(self):
+        # People copy this form out of cookie banners and DNS zones.
+        from camoufoxmcp.session import host_in_scope
+        assert host_in_scope("www.example.com", [".example.com"])
+        assert host_in_scope("example.com", [".example.com"])
+
+    def test_lookalike_domain_does_not_match(self):
+        # The failure this guards: str.endswith("example.com") is True for
+        # "notexample.com", so a naive check leaks the header to a domain that
+        # merely ends with the same characters.
+        from camoufoxmcp.session import host_in_scope
+        assert not host_in_scope("notexample.com", ["example.com"])
+        assert not host_in_scope("evil-example.com", ["example.com"])
+
+    def test_empty_scope_matches_nothing(self):
+        # Empty means "no scoping", which the caller handles; this function must
+        # not quietly answer True and turn an unset scope into "send everywhere".
+        from camoufoxmcp.session import host_in_scope
+        assert not host_in_scope("example.com", [])
+        assert not host_in_scope("example.com", None)
+
+    def test_case_insensitive(self):
+        from camoufoxmcp.session import host_in_scope
+        assert host_in_scope("WWW.Example.COM", ["example.com"])
+
+
+class TestHeaderMerging:
+    """merge_headers — what actually goes on the wire for one request."""
+
+    def test_adds_header_on_in_scope_host(self):
+        from camoufoxmcp.session import merge_headers
+        out = merge_headers({}, {"HackerOne": "me"}, "example.com", ["example.com"])
+        assert out["HackerOne"] == "me"
+
+    def test_withholds_header_from_out_of_scope_host(self):
+        from camoufoxmcp.session import merge_headers
+        out = merge_headers({}, {"HackerOne": "me"}, "cdn.other.com", ["example.com"])
+        assert "HackerOne" not in out
+
+    def test_strips_pre_existing_header_on_out_of_scope_host(self):
+        # A header that arrived some other way -- an earlier context-wide
+        # setting, a service worker -- must not survive on an excluded host.
+        from camoufoxmcp.session import merge_headers
+        out = merge_headers({"hackerone": "me"}, {"HackerOne": "me"},
+                            "cdn.other.com", ["example.com"])
+        assert not any(k.lower() == "hackerone" for k in out)
+
+    def test_removal_is_case_insensitive(self):
+        # Playwright reports header names lowercased while callers write them
+        # however they like. Without this, the header goes out twice.
+        from camoufoxmcp.session import merge_headers
+        out = merge_headers({"hackerone": "old"}, {"HackerOne": "new"},
+                            "example.com", ["example.com"])
+        values = [v for k, v in out.items() if k.lower() == "hackerone"]
+        assert values == ["new"]
+
+    def test_unrelated_headers_are_preserved(self):
+        from camoufoxmcp.session import merge_headers
+        out = merge_headers({"accept": "text/html"}, {"HackerOne": "me"},
+                            "example.com", ["example.com"])
+        assert out["accept"] == "text/html"
+        assert out["HackerOne"] == "me"
+
+
+class TestSetHttpHeaders:
+    """The session-level application, against a mocked context."""
+
+    def test_defaults_are_off(self):
+        from camoufoxmcp.session import SessionConfig
+        cfg = SessionConfig()
+        assert cfg.http_headers is None
+        assert cfg.header_scope is None
+
+    def test_unscoped_uses_context_wide_mechanism(self):
+        from camoufoxmcp.session import BrowserSession
+        session = BrowserSession()
+        session._context = MagicMock()
+        result = session._apply_http_headers_sync({"X-A": "1"}, None)
+        assert result["scoped"] is False
+        assert result["headers"] == ["X-A"]
+        session._context.set_extra_http_headers.assert_called_with({"X-A": "1"})
+        session._context.route.assert_not_called()
+        # The disclosure risk is real and easy to reach by omitting an argument,
+        # so the unscoped path says so rather than reporting a clean success.
+        assert "warning" in result
+
+    def test_scoped_uses_routing_and_not_context_headers(self):
+        from camoufoxmcp.session import BrowserSession
+        session = BrowserSession()
+        session._context = MagicMock()
+        result = session._apply_http_headers_sync({"X-A": "1"}, ["example.com"])
+        assert result["scoped"] is True
+        assert result["scope"] == ["example.com"]
+        session._context.route.assert_called_once()
+        # Any context-wide value must be cleared, or the header would ride on
+        # every host the page touches and the scope would mean nothing.
+        session._context.set_extra_http_headers.assert_called_with({})
+
+    def test_clearing_removes_both_mechanisms(self):
+        from camoufoxmcp.session import BrowserSession
+        session = BrowserSession()
+        session._context = MagicMock()
+        session._apply_http_headers_sync({"X-A": "1"}, ["example.com"])
+        session._context.reset_mock()
+        result = session._apply_http_headers_sync(None, None)
+        assert result["status"] == "cleared"
+        session._context.unroute.assert_called_with("**/*")
+        session._context.set_extra_http_headers.assert_called_with({})
+        assert session._header_route_installed is False
+
+    def test_get_headers_masks_values_by_default(self):
+        from camoufoxmcp.session import BrowserSession
+        session = BrowserSession()
+        session._context = MagicMock()
+        session._apply_http_headers_sync({"Authorization": "Bearer supersecret"},
+                                         ["example.com"])
+        masked = session.get_http_headers()
+        assert "supersecret" not in str(masked)
+        assert masked["names"] == ["Authorization"]
+        assert "supersecret" in str(session.get_http_headers(reveal=True))
+
+
+class TestEvaluateHasNoTimeout:
+    """camoufox_evaluate must not advertise a timeout it cannot deliver.
+
+    It used to accept `timeout` and pass it to `Page.evaluate`, which rejects
+    it -- so every call using a function or async expression raised
+    `TypeError: got an unexpected keyword argument 'timeout'`, which is to say
+    the parameter broke the exact forms it appeared to support. The measured
+    alternative, `page.set_default_timeout`, does not bound `evaluate` either:
+    a three-second expression returned despite a 400 ms default.
+
+    So the parameter was removed rather than fixed, and these tests hold that
+    line in both directions -- the tool must not take it back, and the
+    underlying limitation must still be what it was measured to be.
+    """
+
+    def _server_source(self):
+        import pathlib
+        import camoufoxmcp.server as server
+        return pathlib.Path(server.__file__).read_text()
+
+    def test_the_playwright_limitation_still_holds(self):
+        """If a future Playwright adds a timeout, this test says so.
+
+        That is the point of asserting against the installed signature rather
+        than against a comment: the reason for the missing parameter expires
+        with the library, and the failure here is the reminder to revisit it.
+        """
+        import inspect
+        from playwright.sync_api import Page
+
+        parameters = inspect.signature(Page.evaluate).parameters
+        assert "timeout" not in parameters, (
+            "Playwright's Page.evaluate now accepts a timeout (%r) -- the "
+            "parameter can be reinstated and this decision revisited"
+            % (list(parameters),))
+
+    def test_the_tool_does_not_take_a_timeout(self):
+        import asyncio
+        from camoufoxmcp.server import create_server
+
+        tools = {t.name: t for t in asyncio.run(create_server().list_tools())}
+        assert "camoufox_evaluate" in tools
+        schema = tools["camoufox_evaluate"].inputSchema
+        assert "timeout" not in schema.get("properties", {}), (
+            "camoufox_evaluate advertises a timeout parameter it cannot honour")
+
+    def test_no_call_site_passes_timeout_to_evaluate(self):
+        """Belt and braces: the schema and the call must not drift apart."""
+        source = self._server_source()
+        tool = source[source.index("async def camoufox_evaluate"):]
+        tool = tool[:tool.index("async def ", 10)]
+        assert "page.evaluate(expression)" in tool
+        assert "timeout=timeout" not in tool
+
+    def test_the_docs_name_the_real_workaround(self):
+        """A missing parameter with no alternative is just a missing feature."""
+        source = self._server_source()
+        assert "Promise.race" in source, (
+            "the docstring must give the in-page deadline idiom, since there is "
+            "no way to impose one from outside")
+
+    def test_the_instructions_string_no_longer_promises_a_timeout(self):
+        source = self._server_source()
+        assert "camoufox_evaluate(page_id, expression, timeout)" not in source
+
+
+class TestReadmeToolCount:
+    """The README's tool count is a claim about the code, so measure it.
+
+    This drifted twice: the README said 39 while the server registered 38, and
+    adding two tools carried the bad number forward to 41. Both are the same
+    failure -- a figure that was true once, edited by hand, and never checked.
+    A count in prose cannot be kept honest by being careful.
+    """
+
+    def _registered(self):
+        import asyncio
+        from camoufoxmcp.server import create_server
+        return sorted(t.name for t in asyncio.run(create_server().list_tools()))
+
+    def _readme(self):
+        import pathlib
+        root = pathlib.Path(__file__).resolve().parent.parent
+        return (root / "README.md").read_text()
+
+    def test_readme_total_matches_registered_tools(self):
+        import re
+        match = re.search(r"##\s*Tools\s*\((\d+)\s+total\)", self._readme())
+        assert match, "README no longer has a '## Tools (N total)' heading"
+        claimed = int(match.group(1))
+        actual = len(self._registered())
+        assert claimed == actual, (
+            "README claims %d tools, server registers %d" % (claimed, actual))
+
+    def test_architecture_line_matches_registered_tools(self):
+        import re
+        match = re.search(r"server\.py\s*#\s*FastMCP server \+ (\d+) tool", self._readme())
+        assert match, "README architecture tree no longer states a tool count"
+        claimed = int(match.group(1))
+        actual = len(self._registered())
+        assert claimed == actual, (
+            "README architecture line claims %d, server registers %d"
+            % (claimed, actual))
+
+    def test_header_tools_are_documented(self):
+        """A tool nobody can discover is not shipped."""
+        readme = self._readme()
+        for name in self._registered():
+            if name.startswith("camoufox_set_headers") or \
+               name.startswith("camoufox_get_headers"):
+                assert name in readme, "%s is registered but absent from README" % name
+
+
+def _tool_dict(blocks):
+    """Pull the returned dict out of call_tool's ContentBlocks."""
+    for item in (blocks if isinstance(blocks, (list, tuple)) else [blocks]):
+        if isinstance(item, tuple):
+            for part in item:
+                if isinstance(part, dict):
+                    return part
+        elif isinstance(item, dict):
+            return item
+        else:
+            meta = getattr(item, "meta", None)
+            if isinstance(meta, dict):
+                return meta
+    return {}
+
+
+class TestFailureExplainsTheTargetState:
+    """click/type/select/hover must say why they failed, not what to go check.
+
+    All four returned the same generic sentence — "If the element is covered by
+    an overlay, camoufox_snapshot marks it [occluded by ...]" — and no
+    target_state, while camoufox_act probed the element and reported "covered by
+    div#overlay". Measured live before this: the generic hint was the only thing
+    that came back, so the caller had to make a second call to learn what the
+    first one could have told it.
+    """
+
+    def _occluded_state(self):
+        return {
+            "visible": True, "enabled": True, "in_viewport": True, "occluded": True,
+            "occluder": {"tag": "div", "id": "overlay", "cls": "", "role": "",
+                         "text": "Accept cookies"},
+            "tag": "button", "type": "", "name": "", "value": "", "checked": None,
+            "readonly": False, "href": "", "aria_expanded": None,
+            "rect": {"x": 1, "y": 1, "w": 10, "h": 10}, "error": None,
+        }
+
+    def _page(self, state=None, exc=None):
+        page = MagicMock()
+        err = exc or RuntimeError("Page.click: Timeout 5000ms exceeded")
+        for name in ("click", "dblclick", "type", "fill", "hover", "select_option"):
+            getattr(page, name).side_effect = err
+        page.locator.return_value.first.evaluate.return_value = (
+            self._occluded_state() if state is None else state)
+        return page
+
+    def _call(self, tool, args, page):
+        import camoufoxmcp.server as server_mod
+        from camoufoxmcp.server import create_server
+        mcp = create_server()
+        with patch.object(server_mod._session, "get_page", return_value=page):
+            blocks = asyncio.run(mcp.call_tool(tool, args))
+        return _tool_dict(blocks)
+
+    @patch("camoufoxmcp.server._session")
+    def test_click_names_the_occluder(self, mock_session):
+        out = self._call("camoufox_click", {"page_id": "p", "ref": "#covered"}, self._page())
+        assert out["status"] == "error"
+        assert out["target_state"]["occluded"] is True
+        assert "div#overlay" in out["hint"]
+        # The generic wording must be gone, not merely joined by the specific one.
+        assert not out["hint"].lstrip().startswith("If the element is covered")
+
+    @patch("camoufoxmcp.server._session")
+    def test_type_names_the_occluder(self, mock_session):
+        out = self._call("camoufox_type",
+                         {"page_id": "p", "ref": "#name", "text": "x"}, self._page())
+        assert out["status"] == "error"
+        assert "div#overlay" in out["hint"]
+
+    @patch("camoufoxmcp.server._session")
+    def test_hover_names_the_occluder(self, mock_session):
+        out = self._call("camoufox_hover", {"page_id": "p", "ref": "#covered"}, self._page())
+        assert out["status"] == "error"
+        assert "div#overlay" in out["hint"]
+
+    @patch("camoufoxmcp.server._session")
+    def test_select_names_the_occluder(self, mock_session):
+        out = self._call("camoufox_select",
+                         {"page_id": "p", "ref": "#pick", "value": "a"}, self._page())
+        assert out["status"] == "error"
+        assert "div#overlay" in out["hint"]
+
+    @patch("camoufoxmcp.server._session")
+    def test_the_generic_hint_survives_a_probe_that_cannot_run(self, mock_session):
+        # If the probe itself fails there is still something useful to say.
+        page = self._page()
+        page.locator.return_value.first.evaluate.side_effect = RuntimeError("gone")
+        out = self._call("camoufox_click", {"page_id": "p", "ref": "#covered"}, page)
+        assert out["status"] == "error"
+        assert "target_state" not in out
+        assert "camoufox_snapshot" in out["hint"]
+
+    @patch("camoufoxmcp.server._session")
+    def test_a_clean_target_does_not_invent_a_reason(self, mock_session):
+        clean = self._occluded_state()
+        clean.update({"occluded": False, "occluder": None})
+        out = self._call("camoufox_click", {"page_id": "p", "ref": "#covered"},
+                         self._page(state=clean))
+        assert out["status"] == "error"
+        assert "target_state" not in out
+        assert "camoufox_snapshot" in out["hint"]
+
+    @patch("camoufoxmcp.server._session")
+    def test_click_reports_the_retrys_error_not_the_first_attempts(self, mock_session):
+        # The retry waits longer, so the two can differ. The name bound by the
+        # first `except` used to be what got reported; the retry's was dropped.
+        page = MagicMock()
+        page.click.side_effect = [
+            RuntimeError("first attempt: element not visible"),
+            RuntimeError("retry: hard timeout"),
+        ]
+        page.locator.return_value.first.evaluate.return_value = self._occluded_state()
+        out = self._call("camoufox_click", {"page_id": "p", "ref": "#covered"}, page)
+        assert "retry: hard timeout" in out["error"]
+        assert "first attempt" not in out["error"]
+
+
+class TestStateExplanation:
+    """The sentence itself, independent of any tool."""
+
+    def _state(self, **over):
+        base = {"visible": True, "enabled": True, "in_viewport": True,
+                "occluded": False, "occluder": None, "readonly": False, "error": None}
+        base.update(over)
+        return base
+
+    def test_occluder_prefers_id_then_class(self):
+        from camoufoxmcp.server import _state_explanation
+        with_id = _state_explanation(self._state(
+            occluded=True, occluder={"tag": "div", "id": "banner", "cls": "a b"}))
+        assert "div#banner" in with_id
+        with_cls = _state_explanation(self._state(
+            occluded=True, occluder={"tag": "aside", "id": "", "cls": "promo sticky"}))
+        assert "aside.promo" in with_cls
+        assert "sticky" not in with_cls  # first class only, not the whole list
+
+    def test_nameless_occluder_still_reported(self):
+        from camoufoxmcp.server import _state_explanation
+        note = _state_explanation(self._state(occluded=True, occluder={"tag": "div"}))
+        assert "covered by div" in note
+
+    def test_each_reason_appears(self):
+        from camoufoxmcp.server import _state_explanation
+        assert "disabled" in _state_explanation(self._state(enabled=False))
+        assert "not visible" in _state_explanation(self._state(visible=False))
+        assert "off-screen" in _state_explanation(self._state(in_viewport=False))
+        assert "read-only" in _state_explanation(self._state(readonly=True))
+
+    def test_reasons_combine(self):
+        from camoufoxmcp.server import _state_explanation
+        note = _state_explanation(self._state(enabled=False, occluded=True,
+                                              occluder={"tag": "div", "id": "x"}))
+        assert "div#x" in note and "disabled" in note
+
+    def test_a_clean_state_gets_no_sentence(self):
+        from camoufoxmcp.server import _state_explanation
+        assert _state_explanation(self._state()) is None
+
+    def test_an_unprobed_target_gets_no_sentence(self):
+        # A probe that errored has no opinion; guessing would be a fabrication.
+        from camoufoxmcp.server import _state_explanation
+        assert _state_explanation({"error": "detached"}) is None
+        assert _state_explanation({}) is None
+        assert _state_explanation(None) is None

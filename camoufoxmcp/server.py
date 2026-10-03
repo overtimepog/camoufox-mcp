@@ -12,15 +12,28 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from .session import BrowserSession, SessionConfig, BrowserSessionError, PageNotFoundError, PageClosedError, _random_viewport, _detect_screen_size
-from .snapshot import take_snapshot, resolve_ref
+from .session import BrowserSession, SessionConfig, BrowserSessionError, _random_viewport, _detect_screen_size
+from .snapshot import take_snapshot, resolve_ref, ref_freshness, _STATE_PROBE_JS
+from .observe import (
+    detect_blockers,
+    page_fingerprint,
+    fingerprint_delta,
+    run_checks,
+    wait_for_checks,
+    console_index,
+    CHECK_NAMES,
+)
+from . import hardening
+from . import tor as tor_mod
 from .markdown import extract_markdown
 from .vision import take_screenshot
 from .cloudscraper_bridge import fetch_via_cloudscraper, solve_and_inject
@@ -31,9 +44,6 @@ from .flaresolverr_bridge import (
     check_flaresolverr_health,
     start_flaresolverr,
     stop_flaresolverr,
-    ensure_flaresolverr_running,
-    is_flaresolverr_running,
-    FlareSolverrNotRunning,
 )
 
 logger = logging.getLogger("camoufoxmcp")
@@ -42,6 +52,10 @@ LOGS_DIR = Path.home() / ".camoufoxmcp" / "logs"
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 _session = BrowserSession()
+# Unwired. create_server(caps=...) accepts a capability set and stores it here,
+# but no tool consults it, so nothing is actually gated. Kept because the
+# signature is public and changing it is out of scope — but do not read this as
+# "capability gating exists".
 _capabilities: set[str] = set()
 _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="camoufox")
 
@@ -85,21 +99,6 @@ def _err(msg: str, *, hint: str | None = None) -> dict[str, Any]:
     return r
 
 
-async def _safe(handler, *args, **kwargs) -> dict[str, Any]:
-    try:
-        return await handler(*args, **kwargs)
-    except (PageNotFoundError, PageClosedError, BrowserSessionError) as e:
-        return _err(str(e))
-    except Exception as e:
-        err_str = str(e).lower()
-        if any(kw in err_str for kw in ("closed", "crashed", "disconnected", "not connected")):
-            _session._force_cleanup()
-            logger.warning("Browser connection lost: %s", e)
-            return _err("Browser session lost. Call camoufox_launch() to start a new session.")
-        logger.exception("Tool error: %s", type(e).__name__)
-        return _err(f"{type(e).__name__}: {e}")
-
-
 # -----------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------
@@ -112,6 +111,78 @@ def _resolve_page(page_id: str | None = None):
     if not active:
         raise BrowserSessionError("No active page. Launch browser and navigate first.")
     return _session.get_page(active), active
+
+
+# Only snapshot refs can go stale. A raw CSS selector is re-resolved against the
+# live DOM on every use, so it is never pointing at a remembered position.
+_SNAPSHOT_REF_RE = re.compile(r"^e\d+$")
+
+
+def _stale_guard(page: Any, page_id: str, ref: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Check ref freshness before acting on it.
+
+    Returns ``(blocking_error, freshness_note)``. A ref from before a
+    navigation is refused rather than resolved, because resolving it silently
+    acts on whatever now occupies that position — a click that "succeeds" on
+    the wrong element is worse than one that fails.
+
+    A ref that is merely stale (DOM moved, no navigation) proceeds and carries
+    the note, since most mutations are unrelated to the element in hand and
+    refusing outright would make the tool unusable on any live page.
+    """
+    if not isinstance(ref, str) or not _SNAPSHOT_REF_RE.match(ref.lstrip("@")):
+        return None, None
+    try:
+        freshness = ref_freshness(_session, page, page_id)
+    except Exception as exc:
+        logger.debug("freshness check failed: %s", exc)
+        return None, None
+
+    verdict = freshness.get("verdict")
+    if verdict == "hard_stale":
+        return _err(
+            f"STALE_REF {ref}: {freshness.get('detail')}",
+            hint=freshness.get("hint", "Re-run camoufox_snapshot."),
+        ), None
+    if verdict == "stale_warning":
+        return None, freshness
+    return None, None
+
+
+def _attach_freshness(out: dict[str, Any], note: dict[str, Any] | None) -> dict[str, Any]:
+    if note:
+        out["ref_freshness"] = note
+    return out
+
+
+async def _explain_failure(page: Any, selector: str | None) -> dict[str, Any] | None:
+    """Probe the target's state and name why an action failed, if it can.
+
+    Returns the probed state plus the sentence explaining it, or None when the
+    probe cannot run. `camoufox_act` has done this since it was written; the
+    older single-action tools returned a generic "if the element is covered by
+    an overlay, camoufox_snapshot marks it [occluded by ...]" hint instead,
+    which tells the caller what to go and check rather than what is true.
+
+    Measured before this existed: `camoufox_click` on an overlay-covered button
+    came back with that generic sentence and no target_state at all, while the
+    same click through `camoufox_act` came back with "covered by div#overlay".
+    """
+    if not selector:
+        return None
+    try:
+        loop = asyncio.get_event_loop()
+        state = await loop.run_in_executor(
+            _executor, lambda: page.locator(selector).first.evaluate(_STATE_PROBE_JS))
+    except Exception as exc:
+        logger.debug("state probe after failure did not run: %s", exc)
+        return None
+    if not isinstance(state, dict):
+        return None
+    note = _state_explanation(state)
+    if not note:
+        return None
+    return {"state": state, "note": note}
 
 
 # -----------------------------------------------------------------------
@@ -149,7 +220,9 @@ def create_server(caps: set[str] | None = None):
             "camoufox_back(page_id) — navigate back in history\n"
             "camoufox_console(page_id) — get browser console messages (JS errors, warnings)\n\n"
             "JAVASCRIPT:\n"
-            "camoufox_evaluate(page_id, expression, timeout) — run sync or async JS\n\n"
+            "camoufox_evaluate(page_id, expression) — run sync or async JS.\n"
+            "No timeout parameter: Playwright's evaluate takes none, and a\n"
+            "deadline has to go inside the expression as a Promise.race.\n\n"
             "TAB MANAGEMENT:\n"
             "camoufox_new_page() — open additional tab\n"
             "camoufox_list_pages() — see all open tabs\n"
@@ -158,6 +231,17 @@ def create_server(caps: set[str] | None = None):
             "camoufox_get_cookies(urls) — get browser cookies (optionally filtered)\n"
             "camoufox_set_cookies(cookies) — set cookies\n"
             "camoufox_clear_cookies() — clear all cookies\n\n"
+            "CUSTOM REQUEST HEADERS:\n"
+            "camoufox_launch(headers={...}, header_scope=[...]) — set at launch\n"
+            "camoufox_set_headers({...}, [...]) — set/change/clear on a live session\n"
+            "camoufox_get_headers() — report what is in force (values masked)\n"
+            "Some bug-bounty programs require an attribution header on ALL traffic\n"
+            "(e.g. HackerOne: yourhandle). ALWAYS pass header_scope: without it the\n"
+            "header is sent to every host the page touches, including third-party\n"
+            "CDNs and analytics, disclosing the engagement to hosts that are not in\n"
+            "it. Note that a custom header is not CORS-safelisted, so it forces a\n"
+            "preflight OPTIONS on cross-origin calls — if a site fails to load after\n"
+            "you add a header, that is why, and header_scope is the fix.\n\n"
             "CLOUDFLARE BYPASS (two tiers, escalate as needed):\n"
             "Tier 1 (fast, no Docker): camoufox_cloudscraper_fetch(url)\n"
             "  HTTP-level JS solver. Handles IUAM, v1, v2. ~100-500ms.\n"
@@ -177,7 +261,53 @@ def create_server(caps: set[str] | None = None):
             "camoufox_network_capture(page_id) — capture XHR/fetch traffic\n\n"
             "KEY DIFFERENCE from CloakBrowser:\n"
             "Camoufox is Firefox-based Playwright with two-tier Cloudflare bypass —\n"
-            "cloudscraper (fast HTTP) → FlareSolverr (Docker Chromium, guaranteed)."
+            "cloudscraper (fast HTTP) → FlareSolverr (Docker Chromium, guaranteed).\n\n"
+            "ACTING AND VERIFYING (prefer these over raw click/type):\n"
+            "camoufox_act(page_id, action, ref=...) — one call that acts, waits for\n"
+            "  the page to settle, then reports whether anything actually changed.\n"
+            "  Use it when you need to know a click worked. It fires the stale-ref\n"
+            "  and occlusion guards, so a covered or post-navigation target is\n"
+            "  reported rather than silently mis-clicked.\n"
+            "camoufox_verify(page_id, text_present=..., url_matches=...) — asserts\n"
+            "  against the live page and returns the evidence. Deterministic; no\n"
+            "  model judgement. Use it to confirm a claim before reporting it.\n"
+            "camoufox_snapshot annotates each element with [disabled], [off-screen]\n"
+            "  or [occluded by X], so you rarely need a second call to learn why a\n"
+            "  click did nothing.\n\n"
+            "TOR (geo-specific egress and per-session IP isolation):\n"
+            "camoufox_tor_status() — local only. Managed instance + every Tor on\n"
+            "  this machine, and who owns it.\n"
+            "camoufox_tor_start(exit_nodes=None) — start the managed instance.\n"
+            "camoufox_tor_stop() — stop it. Idempotent.\n"
+            "camoufox_tor_new_circuit(exit_nodes=None) — rotate and confirm the new\n"
+            "  exit IP in one call.\n"
+            "camoufox_tor_exit_info() — network round trip (~2-5s): the exit IP a\n"
+            "  target sees, and whether it is Tor.\n"
+            "camoufox_launch(tor=True, tor_isolation='session-a') — route the browser\n"
+            "  through Tor. Two labels never share a circuit and a label always\n"
+            "  reuses its own, but ONLY per launch: Playwright's proxy is per\n"
+            "  context and Camoufox runs one context, so parallel isolated work\n"
+            "  needs parallel launches. Omitting the label means the shared base\n"
+            "  circuit; there is no automatic label per launch.\n"
+            "WHAT TOR DOES NOT BUY: Camoufox randomises its fingerprint, Tor's\n"
+            "  anonymity depends on every user looking identical. Routing Camoufox\n"
+            "  through Tor gives a different egress IP and circuit isolation — not\n"
+            "  anonymity. Tor exit addresses are heavily blocklisted, so this makes\n"
+            "  Cloudflare/Arkose HARDER to pass, not easier. It is not a bypass tier.\n\n"
+            "HARDENED MODE (a stable, normalised identity — not anonymity):\n"
+            "camoufox_launch(hardened=True) — pins one browser identity across\n"
+            "  launches and normalises it with Firefox's own resistFingerprinting,\n"
+            "  so repeat launches present the same platform, OS, screen, timezone\n"
+            "  (UTC) and WebGL instead of a fresh random set each time. Turns\n"
+            "  humanization, caching and profile persistence off; WebRTC and remote\n"
+            "  lookups off. Refuses timezone/locale/user_agent/user_data_dir, each\n"
+            "  of which would contradict or defeat it rather than being ignored.\n"
+            "WHAT HARDENED DOES NOT BUY: anonymity. It reduces uniqueness — and\n"
+            "  notably stops the real timezone leaking, which a default launch does\n"
+            "  hand over — but the IP address is unchanged and a stable identity is\n"
+            "  a small haystack, not a crowd. For anonymity, use Tor Browser run as\n"
+            "  itself. hardened=True with tor=True is strictly better than tor\n"
+            "  alone, and is still not anonymity."
         ),
     )
 
@@ -199,6 +329,13 @@ def create_server(caps: set[str] | None = None):
         color_scheme: str | None = None,
         user_agent: str | None = None,
         user_data_dir: str | None = None,
+        headers: dict[str, str] | None = None,
+        header_scope: list[str] | None = None,
+        tor: bool = False,
+        tor_isolation: str | None = None,
+        tor_exit_nodes: str | None = None,
+        tor_instance: str | None = None,
+        hardened: bool = False,
     ) -> dict[str, Any]:
         """Launch a stealth Camoufox browser instance.
 
@@ -219,11 +356,159 @@ def create_server(caps: set[str] | None = None):
             color_scheme: 'light', 'dark', or 'no-preference'.
             user_agent: Custom user agent override.
             user_data_dir: Persistent profile path (cookies survive restarts).
+            headers: Custom headers sent on every request, e.g.
+                {"HackerOne": "myhandle"}. Required by some bug-bounty programs,
+                which mandate an attribution header on all traffic.
+            header_scope: Hosts the headers are limited to, e.g.
+                ["example.com"]. Entries cover the host and its subdomains.
+                STRONGLY RECOMMENDED whenever the headers identify you: without
+                it they are sent context-wide, including to third-party CDNs,
+                analytics and font hosts — disclosing your engagement to hosts
+                that are not in it.
+            tor: Route all traffic through Tor. Starts the managed instance if
+                needed. Cannot be combined with `proxy` — see the note below.
+            tor_isolation: A label selecting a Tor circuit. Two labels never
+                share a circuit; the same label always reuses its own. Omit it
+                and this session uses the base circuit, shared with every other
+                unlabelled session — there is no automatic per-launch label,
+                because each label permanently takes one of a fixed pool of
+                Tor listeners (see below).
+            tor_exit_nodes: Restrict Tor exits to countries, e.g. 'us' or
+                '{us,ca}'. Applied before the circuit is built.
+            tor_instance: Which Tor to use: 'managed' (default), 'tor_browser',
+                or 'system'. 'tor_browser' attaches to a running Tor Browser —
+                note that rotating its circuit affects that application too.
+            hardened: Pin one browser identity across launches and normalise it
+                via Firefox's own resistFingerprinting. Repeat launches then
+                present the same platform, OS, screen, timezone (UTC) and WebGL
+                as each other instead of a fresh random set. Drops humanization,
+                caching and profile persistence, and turns WebRTC and remote
+                lookups off. Conflicts with timezone/locale/user_agent/
+                user_data_dir, which would contradict or defeat it — those are
+                refused rather than ignored.
+
+        Note:
+            A custom header is not CORS-safelisted. If the page calls an API on a
+            different origin, the browser must send a preflight OPTIONS first,
+            and a site that does not answer OPTIONS will fail to load entirely —
+            use `header_scope` to keep the header on the origin that needs it, or
+            check the site loads before assuming the header was harmless.
+
+            Tor gives a different egress IP and per-session circuit isolation. It
+            does NOT give anonymity: Camoufox randomises its fingerprint, while
+            Tor's model depends on every user looking identical, so a randomised
+            fingerprint makes a Tor session more unique, not less. Tor exit
+            addresses are also heavily blocklisted, so this makes Cloudflare and
+            Arkose harder to pass, not easier. It is not a bypass tier.
+
+            hardened=True is NOT anonymity either, and the distinction is not
+            pedantry. It reduces uniqueness — the same identity every launch, and
+            the real timezone no longer leaks — but the IP address is untouched
+            and a stable identity is still a small haystack, not a crowd. For
+            anonymity the tool is Tor Browser run as itself. Combining hardened
+            with tor=True is allowed and strictly better than tor alone; it is
+            still not anonymity.
         """
         headless = display_mode != "headed"
 
         if _session.is_running:
-            return {"status": "already_running", "pages": _session.list_pages()}
+            # Say plainly that the Tor arguments were not applied. Returning a
+            # bare already_running would let the caller believe it is routed
+            # through Tor when it is not, which is the kind of silent-success
+            # this whole upgrade exists to remove.
+            out: dict[str, Any] = {
+                "status": "already_running",
+                "pages": _session.list_pages(),
+                "hint": "Already running. Use camoufox_set_headers() to change "
+                        "headers on the live session.",
+            }
+            if tor or proxy or hardened:
+                out["ignored"] = {
+                    k: v for k, v in
+                    (("tor", tor), ("tor_isolation", tor_isolation),
+                     ("tor_exit_nodes", tor_exit_nodes), ("proxy", proxy),
+                     ("hardened", hardened))
+                    if v
+                }
+                out["warning"] = (
+                    "The browser was already running, so none of the routing "
+                    "arguments were applied. camoufox_close() then relaunch to "
+                    "change how traffic is routed."
+                )
+            return out
+
+        if tor and proxy:
+            return _err(
+                "tor=True and proxy=... are mutually exclusive",
+                hint="Pass one. A second proxy would silently win over Tor, so "
+                     "this is refused rather than resolved.",
+            )
+
+        if hardened:
+            clashing = hardening.conflicts(
+                timezone=timezone,
+                locale=locale,
+                user_agent=user_agent,
+                user_data_dir=user_data_dir,
+            )
+            if clashing:
+                return _err(
+                    "hardened=True conflicts with: " + ", ".join(sorted(clashing)),
+                    hint=" ".join(clashing[k] for k in sorted(clashing)),
+                )
+
+        proxy_url = proxy
+        proxy_user = proxy_password = None
+        firefox_prefs: dict[str, Any] | None = None
+        tor_info: dict[str, Any] | None = None
+
+        if tor:
+            # No auto-generated label. Each label permanently consumes one of a
+            # fixed pool of SocksPorts, and the pool is declared when tor starts
+            # -- so a fresh random label per launch would exhaust it and leave
+            # listeners behind that nothing will ever reuse. Omitting the label
+            # means the shared base circuit, which is stated in the docstring.
+            isolation = tor_isolation
+            ensure = tor_mod.ensure_tor_running(exit_nodes=tor_exit_nodes)
+            if ensure.get("status") not in ("ready", "already_running", "started"):
+                return _err(
+                    f"Tor is not available: {ensure.get('status')}",
+                    hint=ensure.get("hint") or ensure.get("error")
+                    or "Call camoufox_tor_start() and check the reported progress.",
+                )
+            try:
+                proxy_url, proxy_user, proxy_password = tor_mod.socks_proxy_url(
+                    instance=tor_instance, isolation=isolation)
+            except Exception as exc:
+                # The pool being full is reported rather than silently ignored:
+                # a session that asked for isolation and got the shared circuit
+                # instead is the failure that looks exactly like success.
+                return _err(f"Could not resolve a Tor SOCKS endpoint: {exc}")
+
+            # Remote DNS: without it, hostname lookups go to the local resolver
+            # and leak the very names the session is trying to keep off the
+            # network. WebRTC: it can expose the real address independently of
+            # the proxy, so it goes off. Both are merged over Camoufox's own
+            # defaults rather than replacing them.
+            firefox_prefs = {
+                "network.proxy.socks_remote_dns": True,
+                "media.peerconnection.enabled": False,
+            }
+            tor_info = {
+                "instance": tor_instance or "managed",
+                "isolation": isolation,
+                "exit_nodes": tor_exit_nodes,
+                "socks": proxy_url,
+                "isolation_note": (
+                    "Isolation is one SocksPort per label, so the same label "
+                    "reuses its circuit and different labels do not share one. "
+                    "Omit tor_isolation and this session shares the base "
+                    "circuit with every other unlabelled session."
+                ) if isolation else (
+                    "No tor_isolation label, so this session uses the base "
+                    "circuit and shares it with other unlabelled sessions."
+                ),
+            }
 
         if headless:
             vp = _random_viewport()
@@ -236,7 +521,13 @@ def create_server(caps: set[str] | None = None):
 
         cfg = SessionConfig(
             headless=headless,
-            proxy=proxy,
+            proxy=proxy_url,
+            proxy_username=proxy_user,
+            proxy_password=proxy_password,
+            firefox_user_prefs=firefox_prefs,
+            tor=tor,
+            tor_isolation=tor_info["isolation"] if tor_info else None,
+            tor_exit_nodes=tor_exit_nodes,
             humanize=humanize,
             human_preset=human_preset,
             stealth_args=stealth_args,
@@ -246,12 +537,15 @@ def create_server(caps: set[str] | None = None):
             color_scheme=color_scheme,
             user_agent=user_agent,
             user_data_dir=user_data_dir,
+            http_headers=headers,
+            header_scope=header_scope,
+            hardened=hardened,
         )
 
         await _session.launch(cfg, _executor)
         page_id = await _session.new_page()
 
-        return {
+        out = {
             "status": "launched",
             "page_id": page_id,
             "display_mode": display_mode,
@@ -259,6 +553,74 @@ def create_server(caps: set[str] | None = None):
             "humanize": humanize,
             "hint": "Next: call camoufox_navigate(page_id, url)",
         }
+        # Report what was pinned, and what it is not. The label travels with the
+        # result rather than living only in the docs, because a caller who reads
+        # `hardened: true` and assumes anonymity was misled by the tool.
+        if _session.hardening_report:
+            out["hardened"] = _session.hardening_report
+            out["humanize"] = False
+        # Report the header policy back, so "did the header actually apply?" is
+        # answered by the launch call rather than by a later investigation. The
+        # unscoped case carries a warning because that is the one with a real
+        # disclosure cost and it is easy to reach by simply omitting an argument.
+        header_info = _session.get_http_headers()
+        if header_info["count"]:
+            out["headers"] = header_info
+
+        if tor_info:
+            out["tor"] = tor_info
+            out["tor"]["note"] = (
+                "Isolation is per launch, not per page: Playwright's proxy is per "
+                "context and Camoufox runs a single context. For distinct circuits "
+                "in parallel, launch separate browsers."
+            )
+            out["hint"] = ("Routed through Tor. Verify with "
+                           "camoufox_tor_exit_info() or by reading "
+                           "https://check.torproject.org/api/ip")
+        return out
+
+    @mcp.tool()
+    async def camoufox_set_headers(
+        headers: dict[str, str] | None = None,
+        header_scope: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Set, replace, or clear custom request headers on the live browser.
+
+        Use this when the browser is already running — `camoufox_launch(headers=...)`
+        only applies at launch, and returns `already_running` if a session exists.
+
+        Args:
+            headers: Custom headers to send, e.g. {"HackerOne": "myhandle"}.
+                Pass None or {} to clear all custom headers.
+            header_scope: Hosts the headers are limited to, e.g. ["example.com"].
+                Entries cover the host and its subdomains. OMITTING THIS SENDS
+                THE HEADERS TO EVERY HOST the page touches, including third-party
+                CDNs and analytics — if the header identifies you or the
+                engagement, scope it.
+
+        Returns the policy actually in force, so a scope typo shows up here
+        rather than as a mysterious absence of the header later.
+        """
+        if not _session.is_running:
+            return _err("Browser not running. Call camoufox_launch() first.")
+        result = await _session.set_http_headers(headers, header_scope)
+        result["hint"] = "Verify with camoufox_get_headers()"
+        return result
+
+    @mcp.tool()
+    async def camoufox_get_headers(reveal: bool = False) -> dict[str, Any]:
+        """Report the custom request headers currently in force.
+
+        Values are masked unless reveal=True — a header value is often a bearer
+        token, and this is a status check rather than a request for secrets.
+        Use camoufox_extract_tokens() when you actually want the credentials.
+
+        Args:
+            reveal: Show full header values instead of masked ones.
+        """
+        if not _session.is_running:
+            return _err("Browser not running. Call camoufox_launch() first.")
+        return _session.get_http_headers(reveal=reveal)
 
     @mcp.tool()
     async def camoufox_close() -> dict[str, Any]:
@@ -350,32 +712,46 @@ def create_server(caps: set[str] | None = None):
         def _nav():
             page.goto(url, timeout=timeout, wait_until="domcontentloaded")
             page.wait_for_timeout(6000)
+            blockers = detect_blockers(page)
             return {
                 "url": page.url,
                 "title": page.title(),
+                "blockers": blockers,
             }
 
         result = await loop.run_in_executor(_executor, _nav)
         title = result["title"]
         url_final = result["url"]
+        blockers = result.get("blockers") or {}
 
+        # The title-substring heuristic is kept because callers branch on
+        # `cloudflare_blocked` and it must not change meaning. `blocked` is the
+        # wider verdict alongside it, and catches the things the heuristic
+        # never could: Arkose, hCaptcha, consent overlays, auth walls.
         title_lower = title.lower()
         cf_blocked = any(
             p in title_lower
             for p in ("just a moment", "checking your browser", "cloudflare", "attention required")
-        )
+        ) or blockers.get("reason") == "cloudflare"
 
-        return {
+        out: dict[str, Any] = {
             "status": "navigated",
             "url": url_final,
             "title": title,
             "cloudflare_blocked": cf_blocked,
-            "settled": not cf_blocked,
-            "hint": (
-                "Cloudflare detected. Use camoufox_cloudscraper_solve(page_id) to "
-                "bypass with cloudscraper's JS solver, then re-navigate."
-            ) if cf_blocked else None,
+            "blocked": bool(blockers.get("blocked")),
+            "settled": not blockers.get("blocked"),
         }
+        if blockers.get("blocked"):
+            out["blocker"] = blockers
+            if cf_blocked:
+                out["hint"] = (
+                    "Cloudflare detected. Use camoufox_cloudscraper_solve(page_id) to "
+                    "bypass with cloudscraper's JS solver, then re-navigate."
+                )
+            else:
+                out["hint"] = blockers.get("hint")
+        return out
 
     @mcp.tool()
     async def camoufox_back(page_id: str | None = None) -> dict[str, Any]:
@@ -404,20 +780,31 @@ def create_server(caps: set[str] | None = None):
         page_id: str,
         full: bool = False,
         max_length: int = 12000,
+        state: bool = True,
     ) -> dict[str, Any]:
         """Capture the page's accessibility tree — PRIMARY way to understand pages.
 
         Returns interactive elements with [@eN] ref IDs for camoufox_click,
         camoufox_type, etc. Call this BEFORE interacting with any page.
 
+        Each actionable element is annotated inline with the state that would
+        block it: [disabled], [off-screen], [occluded by div#banner]. That
+        annotation is the answer to "why did my click do nothing?" before you
+        spend a call finding out.
+
         Args:
             page_id: Target page ID.
             full: Include surrounding text context (default: False).
             max_length: Max characters in snapshot (default: 12000).
+            state: Probe live state for actionable elements (default: True).
+                Costs one round trip per actionable element, capped at 60, so
+                it is not free on very large pages — set False there. The
+                result reports state_probed so the cost is visible.
         """
         page = _session.get_page(page_id)
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(_executor, take_snapshot, page, page_id, _session, full, max_length)
+        return await loop.run_in_executor(
+            _executor, take_snapshot, page, page_id, _session, full, max_length, state)
 
     # ==================================================================
     # Keyboard & input
@@ -465,6 +852,11 @@ def create_server(caps: set[str] | None = None):
         """
         page = _session.get_page(page_id)
         clean_ref, selector, frame_idx = resolve_ref(_session, page_id, ref)
+
+        stale_error, freshness = _stale_guard(page, page_id, ref)
+        if stale_error:
+            return stale_error
+
         loop = asyncio.get_event_loop()
 
         def _click():
@@ -480,8 +872,8 @@ def create_server(caps: set[str] | None = None):
             return {"status": "clicked", "ref": f"@{clean_ref}", "double": double}
 
         try:
-            return await loop.run_in_executor(_executor, _click)
-        except Exception as exc:
+            return _attach_freshness(await loop.run_in_executor(_executor, _click), freshness)
+        except Exception:
             # Retry once
             def _retry():
                 target = page
@@ -495,9 +887,25 @@ def create_server(caps: set[str] | None = None):
                     target.click(selector, timeout=5000)
                 return {"status": "clicked", "ref": f"@{clean_ref}", "double": double}
             try:
-                return await loop.run_in_executor(_executor, _retry)
-            except Exception:
-                return _err(f"Click failed: {exc}")
+                return _attach_freshness(await loop.run_in_executor(_executor, _retry), freshness)
+            except Exception as retry_exc:
+                # Report the retry's failure, not the first attempt's. The two
+                # can differ (the retry waits longer, so a transient "not
+                # visible" can become a hard "timeout"), and the retry is what
+                # describes the state the caller is actually in. The first
+                # attempt's exception used to be what this reported, because it
+                # was the one bound by name; the retry's was discarded.
+                out = _err(f"Click failed: {retry_exc}")
+                explained = await _explain_failure(page, selector)
+                if explained:
+                    out["target_state"] = explained["state"]
+                    out["hint"] = (explained["note"] +
+                                   " Re-run camoufox_snapshot if the page navigated.")
+                else:
+                    out["hint"] = ("If the element is covered by an overlay, "
+                                   "camoufox_snapshot marks it [occluded by ...]. "
+                                   "If the page navigated, re-run camoufox_snapshot.")
+                return _attach_freshness(out, freshness)
 
     @mcp.tool()
     async def camoufox_type(
@@ -521,6 +929,11 @@ def create_server(caps: set[str] | None = None):
         """
         page = _session.get_page(page_id)
         clean_ref, selector, frame_idx = resolve_ref(_session, page_id, ref)
+
+        stale_error, freshness = _stale_guard(page, page_id, ref)
+        if stale_error:
+            return stale_error
+
         loop = asyncio.get_event_loop()
 
         def _type():
@@ -536,7 +949,20 @@ def create_server(caps: set[str] | None = None):
                 target.press(selector, "Enter")
             return {"status": "typed", "ref": f"@{clean_ref}", "length": len(text), "submitted": submit}
 
-        return await loop.run_in_executor(_executor, _type)
+        try:
+            return _attach_freshness(await loop.run_in_executor(_executor, _type), freshness)
+        except Exception as exc:
+            out = _err(f"Type failed: {exc}")
+            explained = await _explain_failure(page, selector)
+            if explained:
+                out["target_state"] = explained["state"]
+                out["hint"] = (explained["note"] +
+                               " Re-run camoufox_snapshot if the page navigated.")
+            else:
+                out["hint"] = ("If the field is covered by an overlay, "
+                               "camoufox_snapshot marks it [occluded by ...]. "
+                               "If the page navigated, re-run camoufox_snapshot.")
+            return _attach_freshness(out, freshness)
 
     @mcp.tool()
     async def camoufox_fill_form(
@@ -636,6 +1062,10 @@ def create_server(caps: set[str] | None = None):
         else:
             return _err("Provide one of: value, label, or index.")
 
+        stale_error, freshness = _stale_guard(page, page_id, ref)
+        if stale_error:
+            return stale_error
+
         def _select():
             target = page
             if frame_idx is not None:
@@ -645,7 +1075,18 @@ def create_server(caps: set[str] | None = None):
             selected = target.select_option(selector, **kwargs)
             return {"status": "selected", "ref": f"@{clean_ref}", "selected": selected}
 
-        return await loop.run_in_executor(_executor, _select)
+        try:
+            return _attach_freshness(await loop.run_in_executor(_executor, _select), freshness)
+        except Exception as exc:
+            out = _err(f"Select failed: {exc}")
+            explained = await _explain_failure(page, selector)
+            if explained:
+                out["target_state"] = explained["state"]
+                out["hint"] = (explained["note"] +
+                               " Re-run camoufox_snapshot if the page navigated.")
+            else:
+                out["hint"] = "If the page navigated, re-run camoufox_snapshot."
+            return _attach_freshness(out, freshness)
 
     @mcp.tool()
     async def camoufox_hover(page_id: str, ref: str) -> dict[str, Any]:
@@ -657,6 +1098,10 @@ def create_server(caps: set[str] | None = None):
         clean_ref, selector, frame_idx = resolve_ref(_session, page_id, ref)
         loop = asyncio.get_event_loop()
 
+        stale_error, freshness = _stale_guard(page, page_id, ref)
+        if stale_error:
+            return stale_error
+
         def _hover():
             target = page
             if frame_idx is not None:
@@ -666,7 +1111,21 @@ def create_server(caps: set[str] | None = None):
             target.hover(selector)
             return {"status": "hovered", "ref": f"@{clean_ref}"}
 
-        return await loop.run_in_executor(_executor, _hover)
+        try:
+            return _attach_freshness(await loop.run_in_executor(_executor, _hover), freshness)
+        except Exception as exc:
+            out = _err(f"Hover failed: {exc}")
+            explained = await _explain_failure(page, selector)
+            if explained:
+                # An occluded element is the common reason a hover does
+                # nothing, and hovering is the one action where "it worked but
+                # nothing happened" is otherwise indistinguishable from failure.
+                out["target_state"] = explained["state"]
+                out["hint"] = (explained["note"] +
+                               " Re-run camoufox_snapshot if the page navigated.")
+            else:
+                out["hint"] = "If the page navigated, re-run camoufox_snapshot."
+            return _attach_freshness(out, freshness)
 
     @mcp.tool()
     async def camoufox_drag(
@@ -735,7 +1194,6 @@ def create_server(caps: set[str] | None = None):
     async def camoufox_evaluate(
         page_id: str,
         expression: str,
-        timeout: int = 30000,
     ) -> dict[str, Any]:
         """Execute JavaScript in the page context.
 
@@ -749,16 +1207,43 @@ def create_server(caps: set[str] | None = None):
                 'document.title'
                 '() => { return { url: location.href, cookies: document.cookie }; }'
                 'async () => { await new Promise(r => setTimeout(r, 1000)); return "done"; }'
-            timeout: Max wait time in ms for async expressions (default: 30000).
+
+        Note:
+            There is no timeout parameter, and that is a finding rather than an
+            omission. An earlier version accepted one and passed it to
+            Playwright, which rejects it — `Page.evaluate` takes no timeout, and
+            the call raised `TypeError: got an unexpected keyword argument` for
+            every function or async expression, which is to say for the exact
+            forms the examples above use. `page.set_default_timeout()` was
+            measured as the alternative and does not bound `evaluate` either: a
+            three-second expression returned despite a 400 ms default. So an
+            unbounded expression cannot be given a deadline from here, and a
+            parameter that silently did nothing would be worse than none.
+
+            If you need a deadline, put it in the expression, where it can
+            actually take effect:
+
+                'async () => await Promise.race([slowThing(), new Promise((_, r) => setTimeout(() => r(new Error("timeout")), 5000))])'
+
+            That also leaves the page usable afterwards, which a timeout applied
+            from outside it cannot — the underlying call has no cancellation, so
+            abandoning it would keep the browser's single worker thread busy and
+            wedge every later call on the session.
         """
         page = _session.get_page(page_id)
         loop = asyncio.get_event_loop()
 
         def _eval():
-            result = page.evaluate(expression)
-            return {"status": "evaluated", "result": result}
+            return {"status": "evaluated", "result": page.evaluate(expression)}
 
-        return await loop.run_in_executor(_executor, _eval)
+        try:
+            return await loop.run_in_executor(_executor, _eval)
+        except Exception as exc:
+            return _err(f"Evaluate failed: {type(exc).__name__}: {exc}",
+                        hint="If this expression waits on something slow, wrap "
+                             "it in a Promise.race with your own timer inside "
+                             "the expression — Playwright's evaluate has no "
+                             "timeout to set.")
 
     @mcp.tool()
     async def camoufox_file_upload(page_id: str, ref: str, file_paths: str) -> dict[str, Any]:
@@ -831,7 +1316,7 @@ def create_server(caps: set[str] | None = None):
 
     @mcp.tool()
     async def camoufox_wait(page_id: str, timeout_ms: int = 5000) -> dict[str, Any]:
-        """Wait for the page to settle (no DOM mutations + network idle).
+        """Wait for the page to settle (network idle).
 
         Args:
             page_id: Target page ID.
@@ -839,15 +1324,26 @@ def create_server(caps: set[str] | None = None):
         """
         page = _session.get_page(page_id)
         loop = asyncio.get_event_loop()
+        started = time.time()
 
         def _wait():
-            page.wait_for_load_state("networkidle", timeout=timeout_ms / 1000)
-            return {"status": "settled", "elapsed_ms": timeout_ms}
+            # Playwright's timeout is in MILLISECONDS. This previously divided
+            # by 1000, so the default 5000 ms wait became 5 ms and the tool
+            # reported not_settled essentially always.
+            page.wait_for_load_state("networkidle", timeout=timeout_ms)
+            return {"status": "settled", "elapsed_ms": int((time.time() - started) * 1000)}
 
         try:
             return await loop.run_in_executor(_executor, _wait)
         except Exception:
-            return {"status": "not_settled", "elapsed_ms": timeout_ms, "note": "networkidle timeout reached"}
+            return {
+                "status": "not_settled",
+                "elapsed_ms": int((time.time() - started) * 1000),
+                "note": "networkidle not reached within the timeout",
+                "hint": "A page with long-polling or analytics beacons may never "
+                        "go idle. camoufox_verify checks a specific condition "
+                        "instead, which is usually what you actually want.",
+            }
 
     # ==================================================================
     # Dialogs & console
@@ -1548,4 +2044,422 @@ def create_server(caps: set[str] | None = None):
 
         return await loop.run_in_executor(_executor, _capture)
 
+    # ==================================================================
+    # Act + verify (one call, deterministic)
+    # ==================================================================
+
+    @mcp.tool()
+    async def camoufox_act(
+        page_id: str,
+        action: str,
+        ref: str | None = None,
+        text: str | None = None,
+        value: str | None = None,
+        key: str | None = None,
+        double: bool = False,
+        timeout_ms: int = 5000,
+        verify: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Perform an action and report whether it actually did anything.
+
+        Folds the common interactions into one call that fingerprints the page
+        before and after, so "did my click work?" is answered in the same round
+        trip instead of costing a follow-up snapshot the caller has to
+        interpret. It is also where the guards fire: a ref from before a
+        navigation is refused rather than resolved, and a covered or disabled
+        target is reported by name.
+
+        Prefer this over camoufox_click when the outcome matters.
+
+        Args:
+            page_id: Target page ID.
+            action: One of: click, dblclick, type, fill, select, press, hover,
+                check, uncheck, scroll, upload.
+            ref: Element ref ([@eN] or CSS selector). Required for everything
+                except scroll and press.
+            text: Text for action='type'.
+            value: Option value or label for action='select'; file paths for
+                action='upload'.
+            key: Key for action='press' (default 'Enter').
+            double: Double-click for action='click'.
+            timeout_ms: How long to let the page settle after acting, and the
+                per-action timeout (default: 5000).
+            verify: Optional checks to run after acting, same keys as
+                camoufox_verify. Evaluated deterministically; no model involved.
+
+        Returns:
+            `changed` — did the URL, title, or DOM actually move? `delta`
+            breaks that down. `target_state` reports what the element looked
+            like *before* the action, which is where the explanation lives when
+            nothing happened. `verified` is present only when `verify` was
+            given.
+        """
+        page = _session.get_page(page_id)
+        action = (action or "").strip().lower()
+
+        valid = {"click", "dblclick", "type", "fill", "select", "press",
+                 "hover", "check", "uncheck", "scroll", "upload"}
+        if action not in valid:
+            return _err(f"Unknown action {action!r}",
+                        hint=f"Valid actions: {sorted(valid)}")
+        if action not in ("scroll", "press") and not ref:
+            return _err(f"action={action!r} requires a ref")
+
+        freshness = None
+        if ref:
+            stale_error, freshness = _stale_guard(page, page_id, ref)
+            if stale_error:
+                return stale_error
+
+        selector = frame_idx = None
+        if ref:
+            _clean, selector, frame_idx = resolve_ref(_session, page_id, ref)
+
+        loop = asyncio.get_event_loop()
+        console_before = console_index(_session, page_id)
+
+        def _run():
+            from .snapshot import _STATE_PROBE_JS  # noqa: PLC0415 — avoids a cycle at import time
+
+            target = page
+            if frame_idx is not None:
+                frames = page.frames
+                if frame_idx < len(frames):
+                    target = frames[frame_idx]
+
+            # What the element looked like before we touched it. Recorded even
+            # on success, because "clicked a disabled button" and "clicked a
+            # working button" both look identical in the return value
+            # otherwise, and only the first is a bug in the caller's plan.
+            target_state = None
+            if selector:
+                try:
+                    target_state = page.locator(selector).first.evaluate(_STATE_PROBE_JS)
+                except Exception as exc:
+                    target_state = {"error": f"{type(exc).__name__}: {exc}"[:200]}
+
+            before = page_fingerprint(page, _session, page_id)
+
+            if action == "click":
+                target.click(selector, timeout=timeout_ms, click_count=2 if double else 1)
+            elif action == "dblclick":
+                target.dblclick(selector, timeout=timeout_ms)
+            elif action == "type":
+                target.type(selector, text or "", timeout=timeout_ms)
+            elif action == "fill":
+                target.fill(selector, text or "", timeout=timeout_ms)
+            elif action == "select":
+                if value is None:
+                    raise ValueError("action='select' requires value")
+                try:
+                    target.select_option(selector, value=value, timeout=timeout_ms)
+                except Exception:
+                    # Fall back to matching the visible label, which is what a
+                    # caller passing human-readable text actually means.
+                    target.select_option(selector, label=value, timeout=timeout_ms)
+            elif action == "press":
+                if selector:
+                    target.press(selector, key or "Enter", timeout=timeout_ms)
+                else:
+                    page.keyboard.press(key or "Enter")
+            elif action == "hover":
+                target.hover(selector, timeout=timeout_ms)
+            elif action == "check":
+                target.check(selector, timeout=timeout_ms)
+            elif action == "uncheck":
+                target.uncheck(selector, timeout=timeout_ms)
+            elif action == "scroll":
+                delta = timeout_ms // 50 or 500
+                page.evaluate(f"window.scrollBy(0, {delta if (value or 'down') != 'up' else -delta})")
+            elif action == "upload":
+                if not value:
+                    raise ValueError("action='upload' requires value (comma-separated paths)")
+                target.set_input_files(selector, [p.strip() for p in value.split(",") if p.strip()])
+
+            # Let the page react. Short and bounded: the delta below is what
+            # decides whether we waited long enough, and the caller can pass
+            # verify= with a longer budget when it needs a specific condition.
+            page.wait_for_timeout(min(1500, max(250, timeout_ms // 3)))
+
+            after = page_fingerprint(page, _session, page_id)
+            delta = fingerprint_delta(before, after)
+            blockers = detect_blockers(page)
+            return target_state, delta, blockers
+
+        try:
+            target_state, delta, blockers = await loop.run_in_executor(_executor, _run)
+        except Exception as exc:
+            # A failed action is exactly when the target's pre-state is most
+            # useful, so try to report it rather than only the traceback.
+            explained = await _explain_failure(page, selector) if selector else None
+            out = _err(f"{action} failed: {type(exc).__name__}: {exc}")
+            if explained:
+                out["target_state"] = explained["state"]
+                out["hint"] = explained["note"]
+            elif freshness:
+                out["ref_freshness"] = freshness
+            return out
+
+        out: dict[str, Any] = {
+            "status": "ok",
+            "action": action,
+            "ref": f"@{ref.lstrip('@')}" if ref else None,
+            "changed": delta["changed"],
+            "delta": delta,
+            "elapsed_timeout_ms": timeout_ms,
+        }
+        if target_state:
+            out["target_state"] = target_state
+            explanation = _state_explanation(target_state)
+            if explanation:
+                out["target_state_note"] = explanation
+        if freshness:
+            out["ref_freshness"] = freshness
+        if blockers.get("blocked"):
+            out["blocked"] = True
+            out["blocker"] = blockers
+
+        if not delta["changed"]:
+            out["note"] = (
+                "No observable change in URL, title, or DOM. The action may have "
+                "been a no-op (already-checked box, hover with no effect) or the "
+                "page may not have reacted yet — pass verify= to assert on a "
+                "specific condition instead of inferring from mutation counts."
+            )
+
+        if verify:
+            specs = verify if isinstance(verify, dict) else {}
+            checks = await loop.run_in_executor(
+                _executor, wait_for_checks, page, _session, page_id, specs, timeout_ms,
+                250, console_before)
+            out["verify"] = checks
+            out["verified"] = checks.get("passed")
+
+        return out
+
+    @mcp.tool()
+    async def camoufox_verify(
+        page_id: str,
+        url_matches: str | list[str] | None = None,
+        url_not_matches: str | list[str] | None = None,
+        text_present: str | list[str] | None = None,
+        text_absent: str | list[str] | None = None,
+        element_present: str | list[str] | None = None,
+        element_absent: str | list[str] | None = None,
+        no_console_errors: bool = False,
+        no_blockers: bool = False,
+        http_status: int | list[int] | None = None,
+        console_since: int | None = None,
+        timeout_ms: int = 0,
+    ) -> dict[str, Any]:
+        """Assert conditions against the live page and return the evidence.
+
+        Every check is evaluated deterministically in code — no model judgement
+        anywhere — and each result carries the evidence it was judged on, so a
+        failure says what was actually seen rather than only that it failed.
+
+        Use this before reporting anything as fact. A claim you verified with a
+        check is worth more than a claim you inferred from a snapshot.
+
+        Args:
+            page_id: Target page ID.
+            url_matches: Regex(es); passes if ANY matches the current URL.
+            url_not_matches: Regex(es); passes if NONE match.
+            text_present: Substring(s) that must appear in the body text.
+            text_absent: Substring(s) that must NOT appear.
+            element_present: Ref(s) or CSS selector(s) that must exist.
+            element_absent: Ref(s) or selector(s) that must not exist.
+            no_console_errors: Fail if any console error was logged. Scope it
+                with console_since to ignore errors from page load.
+            no_blockers: Fail if a challenge, consent overlay, or auth wall is
+                detected — see camoufox_snapshot's blocker reporting.
+            http_status: Expected status code(s) for the main document.
+            console_since: Only consider console entries from this index on.
+                Get the index from a previous camoufox_act result, or omit to
+                consider the whole buffer.
+            timeout_ms: Poll until every check passes, up to this long. 0
+                (default) checks once.
+
+        Returns:
+            `passed` overall, plus `checks` with per-check evidence and `failed`
+            naming which ones did not hold. Unrecognised check names are
+            reported in `unknown` and fail the result — a typo must not read as
+            success.
+        """
+        page = _session.get_page(page_id)
+
+        specs: dict[str, Any] = {
+            "url_matches": url_matches,
+            "url_not_matches": url_not_matches,
+            "text_present": text_present,
+            "text_absent": text_absent,
+            "element_present": element_present,
+            "element_absent": element_absent,
+            "no_console_errors": no_console_errors or None,
+            "no_blockers": no_blockers or None,
+            "http_status": http_status,
+        }
+        specs = {k: v for k, v in specs.items() if v is not None}
+
+        if not specs:
+            return _err("No checks requested",
+                        hint=f"Pass at least one of: {list(CHECK_NAMES)}")
+
+        since = console_since if console_since is not None else 0
+        loop = asyncio.get_event_loop()
+
+        if timeout_ms and timeout_ms > 0:
+            return await loop.run_in_executor(
+                _executor, wait_for_checks, page, _session, page_id, specs,
+                timeout_ms, 250, since)
+        return await loop.run_in_executor(
+            _executor, run_checks, page, _session, page_id, specs, since)
+
+    # ==================================================================
+    # Tor
+    # ==================================================================
+
+    @mcp.tool()
+    async def camoufox_tor_status() -> dict[str, Any]:
+        """Report every Tor on this machine and which one is ours.
+
+        Local only — no network traffic, no circuit is built. Use
+        camoufox_tor_exit_info() when you need to know what a target sees.
+
+        Endpoints are identified by asking each control port to identify
+        itself, not by assuming a port is Tor because something is listening on
+        it. Each entry says who owns it, so attaching to someone else's Tor is a
+        decision rather than an accident.
+        """
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(_executor, tor_mod.tor_status)
+
+    @mcp.tool()
+    async def camoufox_tor_start(
+        exit_nodes: str | None = None,
+        timeout_s: float = 90.0,
+    ) -> dict[str, Any]:
+        """Start the managed Tor instance on dedicated ports and wait for it.
+
+        Runs its own tor process, so it does not touch a Tor Browser you may
+        have open — that one lives on different ports and keeps its own
+        circuits. The instance is left running after this server exits, since
+        killing it would break a browser session still using it;
+        camoufox_tor_stop() is the explicit teardown.
+
+        Args:
+            exit_nodes: Restrict exits to countries, e.g. 'us' or '{us,ca}'.
+            timeout_s: Bootstrap budget in seconds (default 90). The first
+                bootstrap fetches a consensus and is genuinely slow; a short
+                budget reports a false failure.
+
+        Returns:
+            `status` of 'started', 'already_running', or a failure status.
+            Bootstrap progress is reported, and a bootstrap that completes
+            without a usable circuit is reported as 'started_no_circuit' rather
+            than as success.
+        """
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            _executor, lambda: tor_mod.start_tor(exit_nodes=exit_nodes, timeout_s=timeout_s))
+        if result.get("status") in ("started", "started_no_circuit", "already_running"):
+            result["next_step"] = (
+                "camoufox_launch(tor=True) to route the browser through it, "
+                "or camoufox_tor_exit_info() to check the exit."
+            )
+        return result
+
+    @mcp.tool()
+    async def camoufox_tor_stop() -> dict[str, Any]:
+        """Stop the managed Tor instance. Idempotent.
+
+        Does not touch a Tor Browser or a system tor daemon — those are not
+        ours to stop.
+        """
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(_executor, tor_mod.stop_tor)
+
+    @mcp.tool()
+    async def camoufox_tor_new_circuit(
+        exit_nodes: str | None = None,
+        instance: str | None = None,
+        verify: bool = True,
+    ) -> dict[str, Any]:
+        """Rotate to a fresh circuit and confirm the exit actually changed.
+
+        Applying an exit policy and rotating are one call on purpose: NEWNYM is
+        rate-limited by Tor, so a caller forced to ask twice wastes its budget.
+        The measured before/after exit IP is what separates "the signal was
+        accepted" from "the exit changed".
+
+        Args:
+            exit_nodes: Restrict exits to countries, e.g. 'us' or '{us,ca}'.
+            instance: 'managed' (default), 'tor_browser', or 'system'.
+            verify: Measure the exit IP before and after (default True). Costs
+                a network round trip through Tor; set False if you only need
+                the signal sent.
+
+        Note:
+            An unchanged exit IP is not a failure. Tor reuses exits, and an
+            ExitNodes restriction narrows the pool further — the result says so
+            rather than presenting it as a rotation.
+        """
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            _executor,
+            lambda: tor_mod.new_circuit(exit_nodes=exit_nodes, instance=instance, verify=verify))
+
+    @mcp.tool()
+    async def camoufox_tor_exit_info(
+        instance: str | None = None,
+        isolation: str | None = None,
+    ) -> dict[str, Any]:
+        """What exit IP a target sees when we egress through Tor, and whether it
+        is Tor at all.
+
+        Makes a real network round trip through Tor (~2-5s), which is why it is
+        separate from camoufox_tor_status. Use it to prove a session is actually
+        routed through Tor rather than only configured to be.
+
+        Args:
+            instance: 'managed' (default), 'tor_browser', or 'system'.
+            isolation: Circuit label. Two calls with different labels returning
+                different exit IPs proves the circuits are isolated. The
+                reverse does not prove they are not — Tor reuses exits.
+        """
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            _executor, lambda: tor_mod.tor_exit_info(instance=instance, isolation=isolation))
+
     return mcp
+
+
+def _state_explanation(state: dict[str, Any]) -> str | None:
+    """Turn an element's pre-action state into a sentence explaining a no-op.
+
+    Called only when something went wrong or nothing changed, so it can afford
+    to be specific.
+    """
+    if not state or state.get("error"):
+        return None
+    reasons = []
+    if state.get("occluded"):
+        occluder = state.get("occluder") or {}
+        name = occluder.get("tag") or "an element"
+        if occluder.get("id"):
+            name += f"#{occluder['id']}"
+        elif occluder.get("cls"):
+            name += f".{str(occluder['cls']).split()[0]}"
+        reasons.append(f"covered by {name}")
+    if state.get("enabled") is False:
+        reasons.append("disabled")
+    if state.get("visible") is False:
+        reasons.append("not visible")
+    elif state.get("in_viewport") is False:
+        reasons.append("off-screen")
+    if state.get("readonly"):
+        reasons.append("read-only")
+    if not reasons:
+        return None
+    return ("The target was already " + ", ".join(reasons) +
+            " before the action, which is the likely reason it had no effect.")

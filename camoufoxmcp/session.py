@@ -16,8 +16,154 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlsplit
+
+from . import hardening
 
 logger = logging.getLogger("camoufoxmcp")
+
+
+def _hardening_launch_kwargs() -> dict[str, Any]:
+    """The launch_options kwargs that make a launch hardened.
+
+    Returned as kwargs rather than applied to the result because
+    ``launch_options`` is where a fingerprint becomes the env vars Camoufox
+    reads -- there is no later point at which it can be injected.
+
+    ``i_know_what_im_doing`` is set deliberately and not to silence a warning
+    that is being ignored: Camoufox warns against a custom fingerprint because
+    it is *less* random than its own generator, and less random is exactly the
+    goal here. Suppressing the warning without that reasoning would be worse
+    than leaving it on.
+    """
+    fingerprint = hardening.load_or_create_fingerprint()
+    kwargs: dict[str, Any] = {
+        "fingerprint": fingerprint,
+        "os": hardening.host_os_family(),
+        "i_know_what_im_doing": True,
+        # Camoufox caches pages and requests when this is on, which is both
+        # cross-run state and a source of launch-to-launch variation.
+        "enable_cache": False,
+        "config": dict(hardening.HARDENED_CONFIG),
+        "firefox_user_prefs": dict(hardening.HARDENED_PREFS),
+        "block_webrtc": True,
+    }
+    webgl = hardening.webgl_config(fingerprint)
+    if webgl:
+        # The fingerprint alone does not pin WebGL: launch_options samples a
+        # fresh vendor/renderer pair on every call, so without this the
+        # renderer changes between launches (measured: NVIDIA in one, AMD in
+        # the next) while everything else stayed pinned.
+        kwargs["webgl_config"] = webgl
+    return kwargs
+
+
+def _build_launch_options(
+    cfg: SessionConfig,
+    headless: bool,
+    window: tuple[int, int] | None,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Build the full ``launch_options`` call for a config.
+
+    Shared by the initial launch and the headed relaunch, because they were
+    two copies of the same construction and hardening is precisely the kind of
+    thing a second copy silently forgets -- a resize would then relaunch with a
+    random fingerprint and report success.
+
+    Returns ``(opts, hardening_report)``; the report is None for an ordinary
+    launch.
+    """
+    from camoufox.utils import launch_options
+
+    # Credentials go in Playwright's own fields, not in the server URL. See
+    # _parse_proxy() for why this matters for Tor.
+    proxy_cfg: dict[str, Any] | None = None
+    if cfg.proxy:
+        server, user, password = _parse_proxy(cfg.proxy)
+        proxy_cfg = {"server": server}
+        if cfg.proxy_username or user:
+            proxy_cfg["username"] = cfg.proxy_username or user
+        if cfg.proxy_password or password:
+            proxy_cfg["password"] = cfg.proxy_password or password
+
+    # Hardened mode is assembled *before* launch_options rather than applied to
+    # its output. launch_options is the only place a fingerprint can be
+    # injected -- it converts it into the env vars Camoufox's patches read -- so
+    # patching the returned dict would be a no-op that looked like it worked.
+    hard: dict[str, Any] = {}
+    report: dict[str, Any] | None = None
+    if cfg.hardened:
+        hard = _hardening_launch_kwargs()
+        report = {
+            "fingerprint": hardening.fingerprint_summary(hard["fingerprint"]),
+            **hardening.describe(),
+        }
+
+    opts = launch_options(
+        headless=headless,
+        # Humanized cursor movement is per-session behaviour that varies, and
+        # its whole purpose is to look like a person rather than like one
+        # stable configuration. Hardened mode drops it.
+        humanize=None if cfg.hardened else (cfg.humanize if cfg.humanize is not False else None),
+        locale=cfg.locale,
+        proxy=proxy_cfg,
+        window=window,
+        **hard,
+    )
+
+    # Merged over Camoufox's defaults rather than replacing them --
+    # launch_options already sets its own prefs, and dropping them would
+    # silently weaken the fingerprint for the sake of hardening the transport.
+    if cfg.firefox_user_prefs:
+        prefs = dict(opts.get("firefox_user_prefs") or {})
+        prefs.update(cfg.firefox_user_prefs)
+        opts["firefox_user_prefs"] = prefs
+
+    # Hardened mode does not persist. A profile directory is exactly the
+    # cross-run state the mode exists to remove, so it is skipped even if one
+    # was configured; camoufox_launch refuses the combination up front, and
+    # this is the belt to that braces.
+    if cfg.user_data_dir and not cfg.hardened:
+        Path(cfg.user_data_dir).mkdir(parents=True, exist_ok=True)
+        opts["user_data_dir"] = cfg.user_data_dir
+
+    return opts, report
+
+
+def _parse_proxy(proxy: str) -> tuple[str, str | None, str | None]:
+    """Split userinfo out of a proxy URL.
+
+    Returns ``(server_url, username, password)``. Playwright takes proxy
+    credentials in separate ``username``/``password`` fields; credentials
+    embedded in the server URL are honoured by Chromium but are not reliable
+    on Firefox, which is the only engine this server drives.
+
+    This does not carry Tor's circuit isolation. It used to be described that
+    way -- the credential would be hashed by ``IsolateSOCKSAuth`` to select a
+    circuit -- but Playwright refuses to launch Firefox with SOCKS
+    authentication at all, so the credential was never sent and the launch
+    failed rather than silently sharing a circuit. Isolation is a dedicated
+    SocksPort per label now; see ``tor.py``.
+    """
+    raw = (proxy or "").strip()
+    if not raw:
+        return "", None, None
+    if "://" not in raw:
+        raw = "http://" + raw
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        return proxy.strip(), None, None
+    if not parts.hostname:
+        return proxy.strip(), None, None
+
+    netloc = parts.hostname
+    if parts.port:
+        netloc = f"{netloc}:{parts.port}"
+    server = f"{parts.scheme}://{netloc}"
+    username = unquote(parts.username) if parts.username else None
+    password = unquote(parts.password) if parts.password else None
+    return server, username, password
 
 
 def _random_viewport(seed: int | None = None) -> dict[str, int]:
@@ -113,6 +259,54 @@ def _ensure_macos_properties_json() -> None:
         logger.debug("Unable to prepare Camoufox macOS properties.json workaround", exc_info=True)
 
 
+def host_in_scope(host: str, patterns: list[str] | None) -> bool:
+    """Whether ``host`` matches any entry in a header-scope allowlist.
+
+    An empty or missing allowlist means "no scoping" and is handled by the
+    caller, not here -- this function answers the narrower question and returns
+    False for an empty list rather than silently meaning "everything".
+
+    Entries match a host and its subdomains: ``stripchat.com`` covers both
+    ``stripchat.com`` and ``www.stripchat.com``. A leading dot is accepted and
+    ignored (``.stripchat.com`` means the same thing) because that is the form
+    people copy out of cookie banners and DNS zones. Matching is case-insensitive
+    and anchored at a label boundary, so ``notstripchat.com`` does not match
+    ``stripchat.com`` -- a plain ``str.endswith`` would say it does, and a header
+    silently leaking to a lookalike domain is exactly the failure this guards.
+    """
+    if not patterns:
+        return False
+    host = (host or "").lower().strip(".")
+    for raw in patterns:
+        pat = (raw or "").lower().strip().strip(".")
+        if not pat:
+            continue
+        if host == pat or host.endswith("." + pat):
+            return True
+    return False
+
+
+def merge_headers(current: dict[str, str], managed: dict[str, str],
+                  host: str, scope: list[str] | None) -> dict[str, str]:
+    """Return the headers to send for one request under a header policy.
+
+    Playwright reports header names lowercased, but callers write them however
+    they like, so every removal here is case-insensitive. Without that, a
+    context that already carries ``hackerone`` keeps it alongside the
+    ``HackerOne`` being added and the request goes out with the header twice.
+
+    The strip always happens, including on requests that are *in* scope. That is
+    what makes the scope authoritative rather than additive: a header that
+    arrived from somewhere else -- a context-wide setting, a service worker, an
+    earlier tool call -- cannot survive on a host this policy excludes.
+    """
+    out = {k: v for k, v in current.items()
+           if k.lower() not in {m.lower() for m in managed}}
+    if host_in_scope(host, scope):
+        out.update(managed)
+    return out
+
+
 @dataclass
 class SessionConfig:
     """Configuration for launching a Camoufox session."""
@@ -129,6 +323,27 @@ class SessionConfig:
     user_data_dir: str | None = None
     extra_args: list[str] | None = None
     storage_state: dict[str, Any] | str | None = None
+    # Custom request headers. Sent on every request when `header_scope` is
+    # empty; sent only to matching hosts when it is set. See set_http_headers().
+    http_headers: dict[str, str] | None = None
+    header_scope: list[str] | None = None
+    # Proxy credentials, split out of `proxy` by _parse_proxy() so they travel
+    # in Playwright's documented fields rather than embedded in the server URL.
+    proxy_username: str | None = None
+    proxy_password: str | None = None
+    # Extra Firefox prefs merged over Camoufox's defaults. Used to harden a
+    # Tor-routed session (remote DNS so lookups do not leak past Tor, and
+    # WebRTC off so it cannot expose the real address).
+    firefox_user_prefs: dict[str, Any] | None = None
+    # Tor routing, for reporting. The proxy fields above carry the actual
+    # wiring -- these exist so the session can describe what it is doing.
+    tor: bool = False
+    tor_isolation: str | None = None
+    tor_exit_nodes: str | None = None
+    # Hardened mode: pin one persisted fingerprint, turn on RFP, and drop every
+    # per-launch randomiser Camoufox owns. See hardening.py -- this reduces
+    # uniqueness, it is not anonymity.
+    hardened: bool = False
 
 
 class BrowserSession:
@@ -152,10 +367,33 @@ class BrowserSession:
         self._display_mode: str = "headless"
         self._current_viewport: dict[str, int] | None = None  # tracked so new pages inherit it
         self._last_config: SessionConfig | None = None
+        # What hardened mode actually pinned, for reporting back on the launch.
+        # None on an ordinary launch, so its presence is itself the answer to
+        # "is this session hardened?".
+        self._hardening_report: dict[str, Any] | None = None
+
+        # Custom request headers, and the route handler enforcing them. The
+        # handler is kept so a later set_http_headers() can unroute exactly the
+        # one it installed; leaving stale handlers stacked would apply old
+        # policies in an order nothing controls.
+        self._http_headers: dict[str, str] = {}
+        self._header_scope: list[str] | None = None
+        self._header_route_installed: bool = False
 
         # Per-page dialog and console stores (populated by page event handlers)
         self._dialogs: dict[str, list[dict[str, Any]]] = {}
         self._console: dict[str, list[dict[str, Any]]] = {}
+
+        # Ref freshness bookkeeping. `_nav_epoch` counts main-frame
+        # navigations per page; `_ref_signature` records the epoch and
+        # mutation bucket at the moment the last snapshot was taken. Together
+        # they answer "is this [@eN] still the element it was?" -- a question
+        # that cannot be answered by looking at the ref itself.
+        # `_nav_url` holds the last URL seen per page, so a fragment-only
+        # change can be told apart from a real navigation.
+        self._nav_epoch: dict[str, int] = {}
+        self._nav_url: dict[str, str] = {}
+        self._ref_signature: dict[str, dict[str, Any]] = {}
 
     # ------------------------------------------------------------------
     # Properties
@@ -168,6 +406,16 @@ class BrowserSession:
     @property
     def display_mode(self) -> str:
         return self._display_mode
+
+    @property
+    def hardening_report(self) -> dict[str, Any] | None:
+        """What this session pinned, or None if it is not a hardened session.
+
+        Its absence is meaningful: an ordinary launch does not get a
+        ``hardened: false`` stub, so the key's presence on a launch result is
+        itself the answer.
+        """
+        return self._hardening_report
 
     @property
     def active_page_id(self) -> str | None:
@@ -226,8 +474,182 @@ class BrowserSession:
             if len(self._console[page_id]) > 200:
                 self._console[page_id] = self._console[page_id][-200:]
 
+        # Main-frame navigations only. Subframe navigations are excluded
+        # deliberately: an ad iframe reloading would otherwise bump the epoch
+        # on every page forever, making every ref permanently "hard stale" and
+        # training the caller to ignore the check. The cost is that a ref
+        # *inside* a navigated subframe is not caught -- a gap worth having,
+        # because the alternative guard is one nobody can use.
+        self._nav_epoch[page_id] = 0
+        self._nav_url.pop(page_id, None)
+
+        def _bump_epoch():
+            self._nav_epoch[page_id] = self._nav_epoch.get(page_id, 0) + 1
+
+        def _on_frame_navigated(frame):
+            # Playwright reports a *fragment* change as a navigation, but the
+            # document is the same and the refs are still valid. Verified: on a
+            # `location.hash = 'x'` the epoch incremented. Counting it would
+            # hard-stale every ref on any scroll-spy or anchor-link page, which
+            # is most docs sites -- so the guard would fire constantly and be
+            # ignored. The URL is compared without its fragment for that reason.
+            try:
+                if frame != page.main_frame:
+                    return
+                url = frame.url or ""
+                previous = self._nav_url.get(page_id)
+                self._nav_url[page_id] = url
+                if previous is None:
+                    return
+                if url.split("#", 1)[0] != previous.split("#", 1)[0]:
+                    _bump_epoch()
+            except Exception:
+                pass
+
+        def _on_load():
+            # A reload navigates to the *same* URL, so the comparison above
+            # cannot see it -- but it does replace the document, so every ref
+            # is stale and must be reported as such. `load` fires for a reload
+            # (and for a first load, where the extra bump is harmless because
+            # only equality between snapshots is ever compared) and does not
+            # fire for a fragment change or a pushState.
+            try:
+                _bump_epoch()
+            except Exception:
+                pass
+
         page.on("dialog", _on_dialog)
         page.on("console", _on_console)
+        page.on("framenavigated", _on_frame_navigated)
+        page.on("load", _on_load)
+
+    # ------------------------------------------------------------------
+    # Custom request headers
+    # ------------------------------------------------------------------
+
+    def _apply_http_headers_sync(self, headers: dict[str, str] | None,
+                                 scope: list[str] | None) -> dict[str, Any]:
+        """(Re)install the header policy on the live context. Executor thread.
+
+        Two mechanisms, chosen by whether a scope was given, and the difference
+        is not cosmetic:
+
+        ``set_extra_http_headers`` is context-wide. It stamps the header onto
+        every request the context makes -- including third-party CDN, analytics
+        and font requests. For an engagement header that is a disclosure to
+        hosts that are not part of the engagement and cannot be being tested.
+
+        ``ctx.route`` is the only mechanism that can scope per host, so a scope
+        switches to it. It costs a handler invocation per request and disables
+        some caching, which is why the unscoped case still uses the cheaper
+        context-wide call.
+        """
+        ctx = self._context
+        if ctx is None:
+            raise BrowserSessionError("Browser not running. Call launch() first.")
+
+        # Tear the old policy down before installing the new one. Unrouting
+        # matters as much as routing: leaving a stale handler stacked means two
+        # policies apply in an order nothing controls.
+        if self._header_route_installed:
+            try:
+                ctx.unroute("**/*")
+            except Exception:
+                logger.debug("unroute failed; continuing", exc_info=True)
+            self._header_route_installed = False
+        try:
+            ctx.set_extra_http_headers({})
+        except Exception:
+            logger.debug("clearing context-wide headers failed", exc_info=True)
+
+        self._http_headers = dict(headers or {})
+        self._header_scope = [s for s in (scope or []) if s and s.strip()] or None
+
+        if not self._http_headers:
+            logger.info("Custom request headers cleared")
+            return {"status": "cleared", "headers": [], "scope": None, "scoped": False}
+
+        if not self._header_scope:
+            ctx.set_extra_http_headers(self._http_headers)
+            logger.info("Applied %d context-wide header(s): %s",
+                        len(self._http_headers), sorted(self._http_headers))
+            return {
+                "status": "applied",
+                "headers": sorted(self._http_headers),
+                "scope": None,
+                "scoped": False,
+                "warning": (
+                    "No header_scope given, so these ride on EVERY request this "
+                    "context makes, including third-party hosts. Pass "
+                    "header_scope=[...] to restrict them to the hosts that are "
+                    "actually in scope."
+                ),
+            }
+
+        def _handler(route, request):
+            try:
+                host = urlsplit(request.url).hostname or ""
+                merged = merge_headers(dict(request.headers), self._http_headers,
+                                       host, self._header_scope)
+                route.continue_(headers=merged)
+            except Exception:
+                # A header policy must never break the request it decorates.
+                # Falling back to an unmodified continue keeps the page working
+                # and loses only the header, which is the honest failure: a
+                # silent breakage here would look like the site being down.
+                logger.warning("Header route handler failed; sending unmodified",
+                               exc_info=True)
+                try:
+                    route.continue_()
+                except Exception:
+                    pass
+
+        ctx.route("**/*", _handler)
+        self._header_route_installed = True
+        logger.info("Applied %d scoped header(s) to %s",
+                    len(self._http_headers), self._header_scope)
+        return {
+            "status": "applied",
+            "headers": sorted(self._http_headers),
+            "scope": list(self._header_scope),
+            "scoped": True,
+        }
+
+    async def set_http_headers(self, headers: dict[str, str] | None,
+                               scope: list[str] | None = None) -> dict[str, Any]:
+        """Set, replace, or clear custom request headers on the live context.
+
+        Passing an empty dict or None clears them.
+        """
+        if not self.is_running:
+            raise BrowserSessionError("Browser not running. Call launch() first.")
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            self._executor, lambda: self._apply_http_headers_sync(headers, scope))
+
+    def get_http_headers(self, reveal: bool = False) -> dict[str, Any]:
+        """Report the header policy currently in force.
+
+        Values are masked unless ``reveal=True``. This is a status call -- the
+        caller asked "what is configured", not "give me the secrets" -- and a
+        header value is often a bearer token. `camoufox_extract_tokens` remains
+        the tool that returns secrets, because calling it is an explicit ask.
+        """
+        def _mask(value: str) -> str:
+            if reveal:
+                return value
+            if len(value) <= 4:
+                return "*" * len(value)
+            return "%s%s (%d chars)" % (value[:4], "*" * 8, len(value))
+
+        return {
+            "status": "ok",
+            "headers": {k: _mask(v) for k, v in self._http_headers.items()},
+            "names": sorted(self._http_headers),
+            "scope": list(self._header_scope) if self._header_scope else None,
+            "scoped": bool(self._header_scope),
+            "count": len(self._http_headers),
+        }
 
     async def launch(self, cfg: SessionConfig, executor: ThreadPoolExecutor) -> None:
         """Launch Camoufox browser in the thread executor."""
@@ -239,27 +661,22 @@ class BrowserSession:
 
         def _sync_launch():
             from camoufox.sync_api import Camoufox
-            from camoufox.utils import launch_options
 
             _ensure_macos_properties_json()
 
-            opts = launch_options(
-                headless=cfg.headless,
-                humanize=cfg.humanize if cfg.humanize is not False else None,
-                locale=cfg.locale,
-                proxy={"server": cfg.proxy} if cfg.proxy else None,
-                window=(cfg.viewport["width"], cfg.viewport["height"])
-                if (not cfg.headless and cfg.viewport)
-                else None,
-            )
+            # Headed mode needs the fingerprint window aligned with the viewport
+            # so pages are not rendered off-screen. Hardened mode needs a fixed
+            # window in both display modes, because the fingerprint's window
+            # metrics are what the page reads back.
+            window = None
+            if cfg.viewport and (cfg.hardened or not cfg.headless):
+                window = (cfg.viewport["width"], cfg.viewport["height"])
 
-            if cfg.user_data_dir:
-                Path(cfg.user_data_dir).mkdir(parents=True, exist_ok=True)
-                opts["user_data_dir"] = cfg.user_data_dir
+            opts, self._hardening_report = _build_launch_options(cfg, cfg.headless, window)
 
             browser = Camoufox(
                 from_options=opts,
-                persistent_context=bool(cfg.user_data_dir),
+                persistent_context=bool(cfg.user_data_dir) and not cfg.hardened,
             )
             raw = browser.__enter__()
 
@@ -284,8 +701,19 @@ class BrowserSession:
         self._active_page_id = None
         self._dialogs = {}
         self._console = {}
+        self._nav_epoch = {}
+        self._nav_url = {}
+        self._ref_signature = {}
         self._current_viewport = dict(cfg.viewport) if cfg.viewport else None
         self._last_config = replace(cfg)
+        # The context is brand new, so no route can be installed on it yet --
+        # clear the flag before applying, or set_http_headers() would try to
+        # unroute a handler that belongs to a context that no longer exists.
+        self._header_route_installed = False
+        await loop.run_in_executor(
+            executor,
+            lambda: self._apply_http_headers_sync(cfg.http_headers, cfg.header_scope),
+        )
         logger.info("Camoufox browser launched (headless=%s, viewport=%s)", cfg.headless, self._current_viewport)
 
     async def new_page(self) -> str:
@@ -365,7 +793,6 @@ class BrowserSession:
             raise BrowserSessionError("Cannot resize headed browser before launch config is available")
 
         from camoufox.sync_api import Camoufox
-        from camoufox.utils import launch_options
         from playwright.sync_api import Browser
 
         _ensure_macos_properties_json()
@@ -410,19 +837,13 @@ class BrowserSession:
             storage_state=storage_state,
         )
 
-        opts = launch_options(
-            headless=False,
-            humanize=cfg.humanize if cfg.humanize is not False else None,
-            locale=cfg.locale,
-            proxy={"server": cfg.proxy} if cfg.proxy else None,
-            window=(width, height),
-        )
-        if cfg.user_data_dir:
-            Path(cfg.user_data_dir).mkdir(parents=True, exist_ok=True)
-            opts["user_data_dir"] = cfg.user_data_dir
+        # Same construction as the initial launch, so a hardened session stays
+        # hardened across a resize instead of quietly coming back with a fresh
+        # random fingerprint.
+        opts, self._hardening_report = _build_launch_options(cfg, False, (width, height))
         browser = Camoufox(
             from_options=opts,
-            persistent_context=bool(cfg.user_data_dir),
+            persistent_context=bool(cfg.user_data_dir) and not cfg.hardened,
         )
         raw = browser.__enter__()
         if isinstance(raw, Browser):
@@ -441,6 +862,14 @@ class BrowserSession:
         self._context = ctx
         self._last_config = cfg
         self._current_viewport = {"width": width, "height": height}
+
+        # A headed resize relaunches the browser, so the header policy has to be
+        # installed on the new context. Restoring it BEFORE the page-restore
+        # loop below is what makes the restored navigations carry the header --
+        # applying it after would silently reload every in-scope page without
+        # it, which is the exact failure the feature exists to prevent.
+        self._header_route_installed = False
+        self._apply_http_headers_sync(cfg.http_headers, cfg.header_scope)
 
         restored = 0
         pages_to_restore = old_pages or [{"page_id": f"page_{uuid.uuid4().hex[:8]}", "url": "about:blank", "active": True}]
@@ -640,6 +1069,9 @@ class BrowserSession:
         self._active_page_id = None
         self._dialogs = {}
         self._console = {}
+        self._nav_epoch = {}
+        self._nav_url = {}
+        self._ref_signature = {}
         self._browser = None
         self._context = None
         logger.info("Camoufox browser closed")
@@ -650,5 +1082,8 @@ class BrowserSession:
         self._active_page_id = None
         self._dialogs = {}
         self._console = {}
+        self._nav_epoch = {}
+        self._nav_url = {}
+        self._ref_signature = {}
         self._browser = None
         self._context = None
