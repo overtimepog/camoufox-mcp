@@ -371,6 +371,9 @@ class BrowserSession:
         # None on an ordinary launch, so its presence is itself the answer to
         # "is this session hardened?".
         self._hardening_report: dict[str, Any] | None = None
+        # Name of the vault account this session was launched from or loaded,
+        # so close can write refreshed tokens back. None for an anonymous session.
+        self.account_name: str | None = None
 
         # Custom request headers, and the route handler enforcing them. The
         # handler is kept so a later set_http_headers() can unroute exactly the
@@ -1008,6 +1011,27 @@ class BrowserSession:
     # Cookie management
     # ------------------------------------------------------------------
 
+    def export_storage_state(self) -> dict[str, Any]:
+        """Cookies + localStorage of the live context (Playwright storage_state)."""
+        return self._context.storage_state()
+
+    def import_storage_state(self, state: dict[str, Any]) -> dict[str, int]:
+        """Apply a saved login to the RUNNING context.
+
+        Cookies are added directly. localStorage can only be written from inside
+        its origin, so it is installed as an init script (applies to pages loaded
+        from now on, including already-open tabs after their next navigation).
+        """
+        from . import accounts
+
+        cookies = state.get("cookies") or []
+        if cookies:
+            self._context.add_cookies(cookies)
+        script = accounts.local_storage_init_script(state)
+        if script:
+            self._context.add_init_script(script)
+        return {"cookies": len(cookies), "local_storage_origins": len(state.get("origins") or [])}
+
     def get_cookies(self, urls: list[str] | None = None) -> list[dict[str, Any]]:
         """Get all cookies from the browser context, optionally filtered by URL."""
         cookies = self._context.cookies(urls) if urls else self._context.cookies()
@@ -1074,6 +1098,7 @@ class BrowserSession:
         self._ref_signature = {}
         self._browser = None
         self._context = None
+        self.account_name = None
         logger.info("Camoufox browser closed")
 
     def _force_cleanup(self) -> None:

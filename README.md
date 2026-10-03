@@ -51,13 +51,13 @@ Tier 2 uses FlareSolverr (Docker-based headless Chromium) to bypass Turnstile, J
 # First Tier 2 call auto-pulls the image and starts the container.
 ```
 
-## Tools (47 total)
+## Tools (51 total)
 
 ### Browser Lifecycle
 
 | Tool | Description |
 |------|-------------|
-| `camoufox_launch` | Start stealth browser (Firefox-based Playwright). Accepts `headers`/`header_scope`, `tor=True` (+ `tor_isolation`, `tor_exit_nodes`), and `hardened=True` — see [Tor](#tor) and [Hardened Mode](#hardened-mode) for what each does and does not buy. |
+| `camoufox_launch` | Start stealth browser (Firefox-based Playwright). Accepts `headers`/`header_scope`, `tor=True` (+ `tor_isolation`, `tor_exit_nodes`), `hardened=True`, and `account="name"` (start already logged in) — see [Tor](#tor) and [Hardened Mode](#hardened-mode) for what each does and does not buy. |
 | `camoufox_set_headers` | Set, replace, or clear custom request headers on a live session |
 | `camoufox_get_headers` | Report the header policy in force (values masked unless `reveal=True`) |
 | `camoufox_resize_viewport` | Resize viewport; in headed mode, relaunches Camoufox with matching fingerprint window and restores cookies/URLs |
@@ -113,6 +113,29 @@ Tier 2 uses FlareSolverr (Docker-based headless Chromium) to bypass Turnstile, J
 | `camoufox_get_cookies` | Get all browser cookies (optional URL filter) |
 | `camoufox_set_cookies` | Set cookies from JSON array |
 | `camoufox_clear_cookies` | Clear all cookies |
+
+### Saved Accounts (re-usable logins)
+
+Log in once, save the session under a name, and restore it later without touching the login form again. What is saved is the browser's **session** (cookies + localStorage), not a password — no password is ever stored or requested.
+
+| Tool | Description |
+|------|-------------|
+| `camoufox_save_account` | Save the live login as `name` (+ optional `site`, `username` label, `notes`). Re-saving refreshes the session and keeps old metadata |
+| `camoufox_list_accounts` | List saved accounts: site, cookie domains, expiry. Never shows cookie/storage values. Optional `site` filter |
+| `camoufox_load_account` | Apply a saved account to the *running* browser (cookies now, localStorage on next page load — navigate after) |
+| `camoufox_delete_account` | Remove a saved account from the vault |
+
+`camoufox_launch(account="name")` restores the session at context creation. An account-bound session is **re-saved on `camoufox_close`**, so tokens the site refreshed while you worked persist. If the live session is empty at close (the site logged you out), the previous good login is kept rather than overwritten.
+
+```
+camoufox_launch(display_mode="headed")      # log in by hand or with fill_form
+camoufox_save_account("github-alice", username="alice")
+camoufox_close()
+...later...
+camoufox_launch(account="github-alice")     # already logged in
+```
+
+**Security.** A saved session is a credential: anyone who can read the file can act as that account. Files live in `~/.camoufoxmcp/accounts/` (override with `CAMOUFOX_MCP_ACCOUNTS_DIR`), directory `0700`, files `0600`, written atomically. Account names are restricted to `[A-Za-z0-9._-]` so a name can never address a file outside the vault. Sites can still expire a session server-side; when that happens, log in again and re-save. `account` cannot be combined with `user_data_dir` (a whole browser profile) — pick one.
 
 ### Custom Request Headers
 
@@ -486,13 +509,14 @@ camoufox-mcp/
 ├── camoufoxmcp/
 │   ├── __init__.py              # v0.9.0
 │   ├── __main__.py              # Entry point
-│   ├── server.py                # FastMCP server + 47 tool definitions
+│   ├── server.py                # FastMCP server + 51 tool definitions
 │   ├── session.py               # BrowserSession: lifecycle, dialogs, console, cookies, tabs
 │   ├── snapshot.py              # Accessibility-tree snapshot + CSS selector ref resolution
 │   ├── markdown.py              # trafilatura + regex fallback markdown extraction
 │   ├── vision.py                # Screenshots with optional element annotation overlays
 │   ├── tor.py                   # Tor control protocol, managed instance, exit verification
 │   ├── observe.py               # Blocker taxonomy, page fingerprint, deterministic checks
+│   ├── accounts.py              # Account vault: named, re-usable saved logins (0600 files)
 │   ├── hardening.py             # Hardened mode: pinned fingerprint + RFP (not anonymity)
 │   ├── cloudscraper_bridge.py   # Tier 1: HTTP JS solver + cookie injection
 │   └── flaresolverr_bridge.py   # Tier 2: solve, fetch (raw + text), links, Docker mgmt

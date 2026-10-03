@@ -32,6 +32,7 @@ from .observe import (
     console_index,
     CHECK_NAMES,
 )
+from . import accounts as accounts_mod
 from . import hardening
 from . import tor as tor_mod
 from .markdown import extract_markdown
@@ -336,6 +337,7 @@ def create_server(caps: set[str] | None = None):
         tor_exit_nodes: str | None = None,
         tor_instance: str | None = None,
         hardened: bool = False,
+        account: str | None = None,
     ) -> dict[str, Any]:
         """Launch a stealth Camoufox browser instance.
 
@@ -356,6 +358,11 @@ def create_server(caps: set[str] | None = None):
             color_scheme: 'light', 'dark', or 'no-preference'.
             user_agent: Custom user agent override.
             user_data_dir: Persistent profile path (cookies survive restarts).
+            account: Name of a saved account (see camoufox_save_account). Its
+                cookies and localStorage are restored so the browser starts
+                already logged in, and the session is written back to the same
+                name on camoufox_close so refreshed tokens persist. Cannot be
+                combined with user_data_dir.
             headers: Custom headers sent on every request, e.g.
                 {"HackerOne": "myhandle"}. Required by some bug-bounty programs,
                 which mandate an attribution header on all traffic.
@@ -436,6 +443,19 @@ def create_server(caps: set[str] | None = None):
                     "change how traffic is routed."
                 )
             return out
+
+        account_state: dict[str, Any] | None = None
+        if account:
+            if user_data_dir:
+                return _err(
+                    "account and user_data_dir are mutually exclusive",
+                    hint="user_data_dir is a whole browser profile; account is a "
+                         "named login. Use one.",
+                )
+            try:
+                account_state = accounts_mod.load_state(account)
+            except accounts_mod.AccountError as exc:
+                return _err(str(exc), hint="camoufox_list_accounts() shows what is saved.")
 
         if tor and proxy:
             return _err(
@@ -537,12 +557,14 @@ def create_server(caps: set[str] | None = None):
             color_scheme=color_scheme,
             user_agent=user_agent,
             user_data_dir=user_data_dir,
+            storage_state=account_state,
             http_headers=headers,
             header_scope=header_scope,
             hardened=hardened,
         )
 
         await _session.launch(cfg, _executor)
+        _session.account_name = account
         page_id = await _session.new_page()
 
         out = {
@@ -627,8 +649,12 @@ def create_server(caps: set[str] | None = None):
         """Close the Camoufox browser and release all resources."""
         if not _session.is_running:
             return {"status": "not_running"}
+        saved = await _autosave_account()
         await _session.close()
-        return {"status": "closed"}
+        out: dict[str, Any] = {"status": "closed"}
+        if saved:
+            out["account_saved"] = saved
+        return out
 
     @mcp.tool()
     async def camoufox_resize_viewport(
@@ -1406,6 +1432,114 @@ def create_server(caps: set[str] | None = None):
             return {"status": "ok", "cookies": cookies, "count": len(cookies)}
 
         return await loop.run_in_executor(_executor, _get)
+
+    async def _autosave_account() -> str | None:
+        """Write the live session back to its account, if it has one.
+
+        Best effort and never raises: a failure to save must not stop the browser
+        from closing. The previous saved state is kept if the live one is empty
+        (e.g. the site logged the session out), so closing cannot wipe a good login.
+        """
+        name = _session.account_name
+        if not name:
+            return None
+        loop = asyncio.get_event_loop()
+
+        def _save():
+            try:
+                state = _session.export_storage_state()
+                if not state.get("cookies") and not state.get("origins"):
+                    return None
+                accounts_mod.save(name, state)
+                return name
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Could not auto-save account %r: %s", name, exc)
+                return None
+
+        return await loop.run_in_executor(_executor, _save)
+
+    @mcp.tool()
+    async def camoufox_save_account(
+        name: str,
+        site: str | None = None,
+        username: str | None = None,
+        notes: str | None = None,
+    ) -> dict[str, Any]:
+        """Save the current browser login under a name, for re-use later.
+
+        Log in with the browser first, then call this. Stores the context's
+        cookies and localStorage (the session) in the local account vault
+        (~/.camoufoxmcp/accounts, files 0600). NO password is stored. Restore it
+        with camoufox_launch(account=name) or camoufox_load_account(name).
+        Saving again under the same name refreshes the session and keeps the
+        metadata you do not pass. After this, the live session is bound to the
+        account and is re-saved automatically on camoufox_close.
+
+        Args:
+            name: Letters, digits, '.', '_', '-' (e.g. "github-alice").
+            site: Site this login is for. Guessed from the cookies if omitted.
+            username: A label for who this is (not a secret).
+            notes: Free text.
+        """
+        if not _session.is_running:
+            return _err("No browser running.", hint="Call camoufox_launch() and log in first.")
+        loop = asyncio.get_event_loop()
+
+        def _save():
+            state = _session.export_storage_state()
+            return accounts_mod.save(name, state, site=site, username=username, notes=notes)
+
+        try:
+            info = await loop.run_in_executor(_executor, _save)
+        except accounts_mod.AccountError as exc:
+            return _err(str(exc))
+        _session.account_name = name
+        return {"status": "saved", "account": info}
+
+    @mcp.tool()
+    async def camoufox_list_accounts(site: str | None = None) -> dict[str, Any]:
+        """List saved accounts: name, site, username label, cookie domains, expiry.
+
+        Never returns cookie or storage values. Pass `site` to filter (substring).
+        """
+        items = accounts_mod.list_accounts(site)
+        return {"status": "ok", "count": len(items), "accounts": items,
+                "vault": str(accounts_mod.vault_dir())}
+
+    @mcp.tool()
+    async def camoufox_load_account(name: str) -> dict[str, Any]:
+        """Log the RUNNING browser into a saved account.
+
+        Applies the account's cookies now and its localStorage on the next page
+        load from each origin, so navigate (or reload) after calling this. To
+        start already logged in, prefer camoufox_launch(account=name), which
+        restores everything at context creation. The session is bound to the
+        account and re-saved on camoufox_close.
+        """
+        if not _session.is_running:
+            return _err("No browser running.",
+                        hint="Use camoufox_launch(account=name) to start logged in.")
+        try:
+            state = accounts_mod.load_state(name)
+        except accounts_mod.AccountError as exc:
+            return _err(str(exc), hint="camoufox_list_accounts() shows what is saved.")
+        loop = asyncio.get_event_loop()
+        applied = await loop.run_in_executor(_executor, lambda: _session.import_storage_state(state))
+        _session.account_name = name
+        return {"status": "loaded", "account": name, "applied": applied,
+                "hint": "Navigate or reload the site so the restored login takes effect."}
+
+    @mcp.tool()
+    async def camoufox_delete_account(name: str) -> dict[str, Any]:
+        """Delete a saved account from the vault. Does not log the live browser out."""
+        try:
+            accounts_mod.delete(name)
+        except accounts_mod.AccountError as exc:
+            return _err(str(exc))
+        if _session.account_name == name:
+            # Otherwise close would silently re-create what was just deleted.
+            _session.account_name = None
+        return {"status": "deleted", "account": name}
 
     @mcp.tool()
     async def camoufox_set_cookies(cookies_json: str) -> dict[str, Any]:
