@@ -51,7 +51,7 @@ Tier 2 uses FlareSolverr (Docker-based headless Chromium) to bypass Turnstile, J
 # First Tier 2 call auto-pulls the image and starts the container.
 ```
 
-## Tools (54 total)
+## Tools (56 total)
 
 ### Browser Lifecycle
 
@@ -126,7 +126,9 @@ Log in once, save the session under a name, and restore it later without touchin
 | `camoufox_delete_account` | Remove a saved account from the vault (and its keychain password) |
 | `camoufox_save_credentials` | Store username + password in the **OS keychain** for autofill. `from_page=True` (default) reads them from the login form you filled in, so the password never passes through the conversation |
 | `camoufox_autofill` | Fill the login form on the current page from saved credentials (`submit=True` presses Enter). Handles two-step logins. Refuses on any page that isn't the account's site |
-| `camoufox_forget_credentials` | Remove the saved password; keeps the session |
+| `camoufox_forget_credentials` | Remove the saved password **and TOTP secret**; keeps the session |
+| `camoufox_save_totp` | Store an authenticator secret (base32 key or `otpauth://` URI) in the keychain for 2FA |
+| `camoufox_autofill_totp` | Enter the current 2FA code into the page's verification field (single box or one-digit-per-box). Waits out a window about to roll over. Origin-locked; code never returned |
 
 `camoufox_launch(account="name")` restores the session at context creation. An account-bound session is **re-saved on `camoufox_close`**, so tokens the site refreshed while you worked persist. If the live session is empty at close (the site logged you out), the previous good login is kept rather than overwritten.
 
@@ -156,7 +158,18 @@ camoufox_save_account("example-alice")           # refresh the saved session
 - **Passwords live only in the OS keychain** (macOS Keychain, Windows Credential Locker, Secret Service/KWallet) via `keyring`. Never in the vault JSON, never in a tool result. With no secure keychain, saving is **refused** — there is no plaintext fallback.
 - **Keep the password out of the chat.** Use `from_page=True`: the values are read from the form fields in the browser. Passing `password=` explicitly works but puts it in the conversation history.
 - **Origin-bound.** Autofill only runs when the page host is the account's `site` (or a subdomain). `evilexample.com` does not match `example.com`. Without this, a lookalike page could talk an agent into handing over the real password.
-- **Scope.** Fills visible username/password fields on the top-level page, including two-step flows (run it on each step). It does not solve MFA/TOTP prompts or fill inside cross-origin iframes.
+- **Scope.** Fills visible username/password fields on the top-level page, including two-step flows (run it on each step). It does not fill inside cross-origin iframes or handle passkeys / SMS / push approval.
+
+#### 2FA (authenticator codes)
+
+```
+camoufox_save_totp("example-alice", "JBSW Y3DP EHPK 3PXP")   # the setup key shown beside the site's QR code
+...at login...
+camoufox_autofill("example-alice", submit=True)              # username + password
+camoufox_autofill_totp("example-alice", submit=True)         # on the 2FA prompt
+```
+
+Codes are generated locally (RFC 6238, standard library only; SHA1/256/512, 6–8 digits, any period) from a secret held in the OS keychain. Same origin lock as password autofill. If the current window has under 4 seconds left, it waits for the next one so the code isn't stale when the site checks it. **Caveat:** unlike a password, the setup key can't be read off a form, so `camoufox_save_totp` passes it through the conversation once — treat it as exposed to that history. Storing the password *and* the TOTP secret together means this tool alone can satisfy both factors; that is the usual trade-off of any password manager that holds both, so only do it for accounts where that is acceptable.
 
 **Security.** A saved session is a credential: anyone who can read the file can act as that account. Files live in `~/.camoufoxmcp/accounts/` (override with `CAMOUFOX_MCP_ACCOUNTS_DIR`), directory `0700`, files `0600`, written atomically. Account names are restricted to `[A-Za-z0-9._-]` so a name can never address a file outside the vault. Sites can still expire a session server-side; when that happens, log in again and re-save. `account` cannot be combined with `user_data_dir` (a whole browser profile) — pick one.
 
@@ -532,7 +545,7 @@ camoufox-mcp/
 ├── camoufoxmcp/
 │   ├── __init__.py              # v0.9.0
 │   ├── __main__.py              # Entry point
-│   ├── server.py                # FastMCP server + 54 tool definitions
+│   ├── server.py                # FastMCP server + 56 tool definitions
 │   ├── session.py               # BrowserSession: lifecycle, dialogs, console, cookies, tabs
 │   ├── snapshot.py              # Accessibility-tree snapshot + CSS selector ref resolution
 │   ├── markdown.py              # trafilatura + regex fallback markdown extraction

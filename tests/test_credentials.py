@@ -180,3 +180,105 @@ class TestTools:
         assert _call("camoufox_delete_account", {"name": "al"})["credentials_removed"] is True
         with pytest.raises(cred.CredentialError):
             cred.load("al")
+
+
+# RFC 6238 appendix B vectors (SHA1/SHA256/SHA512, 8 digits).
+RFC_SECRETS = {
+    "SHA1": b"12345678901234567890",
+    "SHA256": b"12345678901234567890123456789012",
+    "SHA512": b"1234567890123456789012345678901234567890123456789012345678901234",
+}
+RFC_VECTORS = [
+    (59, "SHA1", "94287082"), (59, "SHA256", "46119246"), (59, "SHA512", "90693936"),
+    (1111111109, "SHA1", "07081804"), (1234567890, "SHA1", "89005924"),
+    (20000000000, "SHA512", "47863826"),
+]
+
+
+class TestTotp:
+    @pytest.mark.parametrize("at,algo,expected", RFC_VECTORS)
+    def test_rfc6238_vectors(self, at, algo, expected):
+        import base64
+        p = {"secret": base64.b32encode(RFC_SECRETS[algo]).decode(), "digits": 8,
+             "period": 30, "algo": algo}
+        assert cred.totp_code(p, at=at) == expected
+
+    def test_parse_bare_and_uri(self):
+        p = cred.parse_totp_secret("jbsw y3dp ehpk 3pxp")
+        assert p["secret"] == "JBSWY3DPEHPK3PXP" and p["digits"] == 6
+        q = cred.parse_totp_secret(
+            "otpauth://totp/x:al?secret=JBSWY3DPEHPK3PXP&digits=8&period=60&algorithm=sha256")
+        assert (q["digits"], q["period"], q["algo"]) == (8, 60, "SHA256")
+
+    @pytest.mark.parametrize("bad", ["", "not base32!!", "otpauth://hotp/x?secret=JBSWY3DP",
+                                     "otpauth://totp/x?secret=JBSWY3DP&digits=3"])
+    def test_parse_rejects(self, bad):
+        with pytest.raises(cred.CredentialError):
+            cred.parse_totp_secret(bad)
+
+    def test_seconds_left(self):
+        assert cred.seconds_left({"period": 30}, at=59) == 1
+
+
+class OtpPage(FakePage):
+    def __init__(self, url, found):
+        super().__init__(url)
+        self.otp = found
+
+    def evaluate(self, js):
+        return self.otp if js is cred.FIND_OTP_JS else super().evaluate(js)
+
+
+class TestTotpTools:
+    def _acct(self):
+        accounts.save("al", {"cookies": [], "origins": []}, site="example.com", allow_empty=True)
+
+    def test_save_requires_account_and_never_echoes_secret(self, monkeypatch):
+        monkeypatch.setattr(srv, "_session", FakeSession(FakePage("https://example.com/")))
+        assert _call("camoufox_save_totp", {"name": "al", "secret": "JBSWY3DPEHPK3PXP"})["status"] == "error"
+        self._acct()
+        out = _call("camoufox_save_totp", {"name": "al", "secret": "JBSWY3DPEHPK3PXP"})
+        assert out["status"] == "saved" and "JBSWY3DP" not in json.dumps(out)
+        assert accounts.describe("al")["has_totp"] is True
+        assert "JBSWY3DP" not in json.dumps(accounts._read("al"))
+
+    def test_single_field_fill_does_not_return_code(self, monkeypatch):
+        self._acct()
+        cred.save_totp("al", cred.parse_totp_secret("JBSWY3DPEHPK3PXP"))
+        page = OtpPage("https://example.com/2fa", {"count": 1, "split": False})
+        monkeypatch.setattr(srv, "_session", FakeSession(page))
+        monkeypatch.setattr(cred, "seconds_left", lambda p, at=None: 20)
+        out = _call("camoufox_autofill_totp", {"name": "al", "submit": True})
+        code = page.filled[cred.OTP_SEL]
+        assert out["status"] == "filled" and len(code) == 6 and code.isdigit()
+        assert code not in json.dumps(out) and page.pressed == [(cred.OTP_SEL, "Enter")]
+
+    def test_split_boxes_get_one_digit_each(self, monkeypatch):
+        self._acct()
+        cred.save_totp("al", cred.parse_totp_secret("JBSWY3DPEHPK3PXP"))
+        page = OtpPage("https://example.com/2fa", {"count": 6, "split": True})
+        monkeypatch.setattr(srv, "_session", FakeSession(page))
+        monkeypatch.setattr(cred, "seconds_left", lambda p, at=None: 20)
+        _call("camoufox_autofill_totp", {"name": "al"})
+        assert sorted(page.filled) == [f'[data-cmcp-otp="{i}"]' for i in range(6)]
+        assert all(len(v) == 1 for v in page.filled.values())
+
+    def test_refuses_wrong_host_and_missing_field(self, monkeypatch):
+        self._acct()
+        cred.save_totp("al", cred.parse_totp_secret("JBSWY3DPEHPK3PXP"))
+        bad = OtpPage("https://evilexample.com/2fa", {"count": 1, "split": False})
+        monkeypatch.setattr(srv, "_session", FakeSession(bad))
+        assert "not example.com" in _call("camoufox_autofill_totp", {"name": "al"})["error"]
+        assert bad.filled == {}
+        none = OtpPage("https://example.com/", {"count": 0, "split": False})
+        monkeypatch.setattr(srv, "_session", FakeSession(none))
+        assert _call("camoufox_autofill_totp", {"name": "al"})["status"] == "error"
+
+    def test_forget_and_delete_remove_totp(self, monkeypatch):
+        self._acct()
+        cred.save_totp("al", cred.parse_totp_secret("JBSWY3DPEHPK3PXP"))
+        accounts.set_credentials_flag("al", True, key="totp")
+        out = _call("camoufox_forget_credentials", {"name": "al"})
+        assert out["totp_removed"] is True and accounts.describe("al")["has_totp"] is False
+        with pytest.raises(cred.CredentialError):
+            cred.load_totp("al")

@@ -128,6 +128,7 @@ def save(
         "updated": now,
         # Only a marker. The secret itself is in the OS keychain (credentials.py).
         "credentials": bool(prior.get("credentials", False)),
+        "totp": bool(prior.get("totp", False)),
         "storage_state": state,
     }
 
@@ -149,10 +150,11 @@ def save(
     return describe_record(record)
 
 
-def set_credentials_flag(name: str, value: bool) -> None:
-    """Record whether this account has keychain credentials. Marker only."""
+def set_credentials_flag(name: str, value: bool, key: str = "credentials") -> None:
+    """Record whether this account has keychain credentials (or, with
+    ``key="totp"``, a TOTP secret). Marker only -- the secret is not here."""
     record = _read(name)
-    record["credentials"] = bool(value)
+    record[key] = bool(value)
     d = _ensure_dir()
     fd, tmp = tempfile.mkstemp(dir=d, prefix=f".{name}.", suffix=".tmp")
     try:
@@ -204,6 +206,7 @@ def describe_record(record: dict[str, Any]) -> dict[str, Any]:
         "username": record.get("username"),
         "notes": record.get("notes"),
         "has_credentials": bool(record.get("credentials")),
+        "has_totp": bool(record.get("totp")),
         "created": record.get("created"),
         "updated": record.get("updated"),
         "cookie_count": len(cookies),

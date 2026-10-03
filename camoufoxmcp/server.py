@@ -1539,6 +1539,7 @@ def create_server(caps: set[str] | None = None):
         except accounts_mod.AccountError as exc:
             return _err(str(exc))
         forgot = cred_mod.delete(name)
+        cred_mod.delete_totp(name)
         if _session.account_name == name:
             # Otherwise close would silently re-create what was just deleted.
             _session.account_name = None
@@ -1724,13 +1725,123 @@ def create_server(caps: set[str] | None = None):
 
     @mcp.tool()
     async def camoufox_forget_credentials(name: str) -> dict[str, Any]:
-        """Remove an account's saved password from the keychain. Keeps its session."""
+        """Remove an account's saved password AND TOTP secret from the keychain.
+
+        Keeps the saved session.
+        """
         removed = cred_mod.delete(name)
+        removed_totp = cred_mod.delete_totp(name)
+        for key in ("credentials", "totp"):
+            try:
+                accounts_mod.set_credentials_flag(name, False, key=key)
+            except accounts_mod.AccountError:
+                pass
+        return {"status": "forgotten" if (removed or removed_totp) else "none_stored",
+                "account": name, "totp_removed": removed_totp}
+
+    @mcp.tool()
+    async def camoufox_save_totp(name: str, secret: str) -> dict[str, Any]:
+        """Store an authenticator (TOTP) secret in the OS keychain for 2FA autofill.
+
+        Pass the base32 setup key the site shows next to its QR code (spaces ok)
+        or the full otpauth:// URI. The account must already exist
+        (camoufox_save_account or camoufox_save_credentials first). Unlike a
+        password, this cannot be read from the page, so the secret does pass
+        through this conversation once -- treat it as exposed to that history.
+        Stored only in the keychain; refused if none is available. Use
+        camoufox_autofill_totp on the 2FA prompt afterwards.
+
+        Args:
+            name: Existing account name.
+            secret: Base32 key or otpauth://totp/... URI.
+        """
+        if not cred_mod.available():
+            return _err("No secure keychain backend available; refusing to store a TOTP secret.")
         try:
-            accounts_mod.set_credentials_flag(name, False)
-        except accounts_mod.AccountError:
-            pass
-        return {"status": "forgotten" if removed else "none_stored", "account": name}
+            site = accounts_mod.site_of(name)
+        except accounts_mod.AccountError as exc:
+            return _err(str(exc), hint="Create the account first with "
+                        "camoufox_save_account or camoufox_save_credentials.")
+        try:
+            params = cred_mod.parse_totp_secret(secret)
+            cred_mod.save_totp(name, params)
+            accounts_mod.set_credentials_flag(name, True, key="totp")
+        except (cred_mod.CredentialError, accounts_mod.AccountError) as exc:
+            return _err(str(exc))
+        return {"status": "saved", "account": name, "site": site,
+                "digits": params["digits"], "period": params["period"],
+                "secret_stored": "keychain",
+                "hint": "On the site's 2FA prompt, call camoufox_autofill_totp(name)."}
+
+    @mcp.tool()
+    async def camoufox_autofill_totp(
+        name: str,
+        page_id: str | None = None,
+        submit: bool = False,
+    ) -> dict[str, Any]:
+        """Type the current authenticator code into the page's 2FA field.
+
+        Finds the verification-code input (a single field, or one-digit-per-box
+        layouts), generates the code from the saved TOTP secret, and enters it.
+        If the current 30s window is about to roll over it waits for the next
+        one so the code is not stale when the site checks it. The code is never
+        returned. Same origin lock as camoufox_autofill: refused on any page
+        that is not the account's site.
+
+        Args:
+            name: Account with a saved TOTP secret (camoufox_save_totp).
+            page_id: Page to fill (default: active page).
+            submit: Press Enter after filling.
+        """
+        if not _session.is_running:
+            return _err("No browser running.")
+        try:
+            site = accounts_mod.site_of(name)
+            params = cred_mod.load_totp(name)
+        except accounts_mod.AccountError as exc:
+            return _err(str(exc), hint="camoufox_list_accounts() shows what is saved.")
+        except cred_mod.CredentialError as exc:
+            return _err(str(exc), hint="Save one with camoufox_save_totp().")
+        try:
+            page, pid = _resolve_page(page_id)
+        except (BrowserSessionError, KeyError) as exc:
+            return _err(str(exc))
+        if not site or not cred_mod.host_matches(page.url, site):
+            return _err(
+                f"Refusing to enter a 2FA code: this page is not {site or 'a known site'}.",
+                hint="Codes are only entered on the account's own site.",
+            )
+        loop = asyncio.get_event_loop()
+
+        def _fill():
+            found = page.evaluate(cred_mod.FIND_OTP_JS)
+            if not found["count"]:
+                return None
+            # A code that expires in the next ~4s may be rejected by the time it
+            # is submitted; wait out the rollover and use the fresh one.
+            if cred_mod.seconds_left(params) < 4:
+                time.sleep(cred_mod.seconds_left(params) + 0.3)
+            code = cred_mod.totp_code(params)
+            if found["split"]:
+                for i, ch in enumerate(code[: found["count"]]):
+                    page.fill(f'[data-cmcp-otp="{i}"]', ch)
+                last = f'[data-cmcp-otp="{min(len(code), found["count"]) - 1}"]'
+            else:
+                page.fill(cred_mod.OTP_SEL, code)
+                last = cred_mod.OTP_SEL
+            if submit:
+                page.press(last, "Enter")
+            return found
+
+        try:
+            found = await loop.run_in_executor(_executor, _fill)
+        except Exception as exc:  # noqa: BLE001
+            return _err(f"2FA autofill failed: {type(exc).__name__}: {exc}")
+        if not found:
+            return _err("No verification-code field found on this page.",
+                        hint="Get to the 2FA prompt first (submit the password), then retry.")
+        return {"status": "filled", "page_id": pid, "split_digit_boxes": found["split"],
+                "submitted": bool(submit)}
 
     @mcp.tool()
     async def camoufox_set_cookies(cookies_json: str) -> dict[str, Any]:
