@@ -35,6 +35,8 @@ from .observe import (
 )
 from . import accounts as accounts_mod
 from . import credentials as cred_mod
+from . import frames as frames_mod
+from . import passkeys as passkeys_mod
 from . import hardening
 from . import tor as tor_mod
 from .markdown import extract_markdown
@@ -105,6 +107,27 @@ def _err(msg: str, *, hint: str | None = None) -> dict[str, Any]:
 # -----------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------
+
+def _clean_hosts(hosts: list[str]) -> list[str]:
+    """Normalise user-supplied hosts; drop anything that is not a plain hostname."""
+    out: list[str] = []
+    for h in hosts or []:
+        h = (h or "").strip().lower()
+        if "://" in h:
+            h = urlparse(h).hostname or ""
+        h = h.strip(".")
+        if h and re.fullmatch(r"[a-z0-9]([a-z0-9.-]*[a-z0-9])?", h) and h not in out:
+            out.append(h)
+    return out
+
+
+def _skipped_hint(skipped: list[str]) -> str:
+    if not skipped:
+        return ""
+    return (" Refused third-party iframe(s): " + ", ".join(skipped)
+            + ". If one is this account's real login, trust it with "
+              "camoufox_allow_login_frame(name, host).")
+
 
 def _resolve_page(page_id: str | None = None):
     """Get page — use explicit page_id or fall back to active page."""
@@ -340,6 +363,7 @@ def create_server(caps: set[str] | None = None):
         tor_instance: str | None = None,
         hardened: bool = False,
         account: str | None = None,
+        passkeys: bool = False,
     ) -> dict[str, Any]:
         """Launch a stealth Camoufox browser instance.
 
@@ -360,6 +384,10 @@ def create_server(caps: set[str] | None = None):
             color_scheme: 'light', 'dark', or 'no-preference'.
             user_agent: Custom user agent override.
             user_data_dir: Persistent profile path (cookies survive restarts).
+            passkeys: Allow the software passkey authenticator
+                (camoufox_passkey_enable) in this session. Must be chosen at
+                launch because it needs Camoufox's main-world scripting, which
+                is off otherwise so the default browser stays stock.
             account: Name of a saved account (see camoufox_save_account). Its
                 cookies and localStorage are restored so the browser starts
                 already logged in, and the session is written back to the same
@@ -560,6 +588,7 @@ def create_server(caps: set[str] | None = None):
             user_agent=user_agent,
             user_data_dir=user_data_dir,
             storage_state=account_state,
+            main_world_eval=passkeys,
             http_headers=headers,
             header_scope=header_scope,
             hardened=hardened,
@@ -1540,6 +1569,9 @@ def create_server(caps: set[str] | None = None):
             return _err(str(exc))
         forgot = cred_mod.delete(name)
         cred_mod.delete_totp(name)
+        passkeys_mod.delete_all(name)
+        if _session.passkey_account == name:
+            _session.passkey_account = None
         if _session.account_name == name:
             # Otherwise close would silently re-create what was just deleted.
             _session.account_name = None
@@ -1553,6 +1585,7 @@ def create_server(caps: set[str] | None = None):
         username: str | None = None,
         password: str | None = None,
         site: str | None = None,
+        frame_hosts: list[str] | None = None,
     ) -> dict[str, Any]:
         """Store a username + password in the OS keychain for autofill.
 
@@ -1573,6 +1606,10 @@ def create_server(caps: set[str] | None = None):
             from_page: Read username/password from the visible login form.
             username/password: Explicit values (overrides from_page).
             site: Site these belong to. Defaults to the current page's host.
+            frame_hosts: Third-party iframe hosts to trust for this account, for
+                logins embedded from another domain (e.g. ["auth.sso-vendor.com"]).
+                Frames from the account's own site are always searched; any
+                other frame is refused unless listed here.
         """
         try:
             accounts_mod.validate_name(name)
@@ -1596,12 +1633,18 @@ def create_server(caps: set[str] | None = None):
                 return _err(str(exc))
             loop = asyncio.get_event_loop()
 
-            def _read():
-                found = page.evaluate(cred_mod.FIND_LOGIN_JS)
-                vals = page.evaluate(cred_mod.READ_LOGIN_JS)
-                return found, vals, page.url
+            site_guess = site or (urlparse(page.url).hostname or "")
 
-            found, vals, page_url = await loop.run_in_executor(_executor, _read)
+            def _read():
+                best, skipped = frames_mod.locate(
+                    page, cred_mod.FIND_LOGIN_JS, site_guess, frame_hosts or [],
+                    frames_mod.login_score)
+                if not best:
+                    return {"user": False, "password": False}, {}, page.url, skipped
+                frame, found = best
+                return found, frame.evaluate(cred_mod.READ_LOGIN_JS), page.url, skipped
+
+            found, vals, page_url, skipped = await loop.run_in_executor(_executor, _read)
             username, password = vals.get("username"), vals.get("password")
             if not username or not password:
                 return _err(
@@ -1610,7 +1653,8 @@ def create_server(caps: set[str] | None = None):
                     f"username filled: {bool(username)}, password filled: {bool(password)}).",
                     hint="Fill both fields on one page, or pass them explicitly. "
                          "Two-step logins: fill the username, then save on the "
-                         "password page after typing the password.",
+                         "password page after typing the password."
+                         + _skipped_hint(skipped),
                 )
         if page_url is None and _session.is_running:
             try:
@@ -1635,6 +1679,8 @@ def create_server(caps: set[str] | None = None):
             accounts_mod.save(name, state, site=site_val, username=username,
                               allow_empty=True)
             accounts_mod.set_credentials_flag(name, True)
+            if frame_hosts:
+                accounts_mod.set_field(name, "frame_hosts", _clean_hosts(frame_hosts))
         except accounts_mod.AccountError as exc:
             cred_mod.delete(name)
             return _err(str(exc))
@@ -1694,28 +1740,37 @@ def create_server(caps: set[str] | None = None):
             )
         loop = asyncio.get_event_loop()
 
+        trusted = accounts_mod.frame_hosts_of(name)
+
         def _fill():
-            found = page.evaluate(cred_mod.FIND_LOGIN_JS)
+            best, skipped = frames_mod.locate(
+                page, cred_mod.FIND_LOGIN_JS, site, trusted, frames_mod.login_score)
+            if not best:
+                return [], None, skipped
+            frame, found = best
             filled = []
             if found["user"]:
-                page.fill(cred_mod.USER_SEL, user_val)
+                frame.fill(cred_mod.USER_SEL, user_val)
                 filled.append("username")
             if found["password"]:
-                page.fill(cred_mod.PASS_SEL, pass_val)
+                frame.fill(cred_mod.PASS_SEL, pass_val)
                 filled.append("password")
             if submit and filled:
-                page.press(cred_mod.PASS_SEL if found["password"] else cred_mod.USER_SEL, "Enter")
-            return filled
+                frame.press(cred_mod.PASS_SEL if found["password"] else cred_mod.USER_SEL, "Enter")
+            return filled, frames_mod.frame_label(frame, page), skipped
 
         try:
-            filled = await loop.run_in_executor(_executor, _fill)
+            filled, where, skipped = await loop.run_in_executor(_executor, _fill)
         except Exception as exc:  # noqa: BLE001
             return _err(f"Autofill failed: {type(exc).__name__}: {exc}")
         if not filled:
             return _err("No visible login fields on this page.",
-                        hint="Navigate to the login page first, then call camoufox_autofill().")
+                        hint="Navigate to the login page first, then call camoufox_autofill()."
+                             + _skipped_hint(skipped))
         out: dict[str, Any] = {"status": "filled", "page_id": pid, "filled": filled,
-                               "submitted": bool(submit)}
+                               "submitted": bool(submit), "in": where}
+        if skipped:
+            out["skipped_frames"] = skipped
         if filled == ["username"]:
             out["hint"] = ("Only a username field is showing (two-step login). Submit it, "
                            "then call camoufox_autofill again on the password page.")
@@ -1813,10 +1868,14 @@ def create_server(caps: set[str] | None = None):
             )
         loop = asyncio.get_event_loop()
 
+        trusted = accounts_mod.frame_hosts_of(name)
+
         def _fill():
-            found = page.evaluate(cred_mod.FIND_OTP_JS)
-            if not found["count"]:
-                return None
+            best, skipped = frames_mod.locate(
+                page, cred_mod.FIND_OTP_JS, site, trusted, frames_mod.otp_score)
+            if not best:
+                return None, skipped
+            frame, found = best
             # A code that expires in the next ~4s may be rejected by the time it
             # is submitted; wait out the rollover and use the fresh one.
             if cred_mod.seconds_left(params) < 4:
@@ -1824,24 +1883,188 @@ def create_server(caps: set[str] | None = None):
             code = cred_mod.totp_code(params)
             if found["split"]:
                 for i, ch in enumerate(code[: found["count"]]):
-                    page.fill(f'[data-cmcp-otp="{i}"]', ch)
+                    frame.fill(f'[data-cmcp-otp="{i}"]', ch)
                 last = f'[data-cmcp-otp="{min(len(code), found["count"]) - 1}"]'
             else:
-                page.fill(cred_mod.OTP_SEL, code)
+                frame.fill(cred_mod.OTP_SEL, code)
                 last = cred_mod.OTP_SEL
             if submit:
-                page.press(last, "Enter")
-            return found
+                frame.press(last, "Enter")
+            return (found, frames_mod.frame_label(frame, page)), skipped
 
         try:
-            found = await loop.run_in_executor(_executor, _fill)
+            hit, skipped = await loop.run_in_executor(_executor, _fill)
         except Exception as exc:  # noqa: BLE001
             return _err(f"2FA autofill failed: {type(exc).__name__}: {exc}")
-        if not found:
+        if not hit:
             return _err("No verification-code field found on this page.",
-                        hint="Get to the 2FA prompt first (submit the password), then retry.")
-        return {"status": "filled", "page_id": pid, "split_digit_boxes": found["split"],
-                "submitted": bool(submit)}
+                        hint="Get to the 2FA prompt first (submit the password), then retry."
+                             + _skipped_hint(skipped))
+        found, where = hit
+        out = {"status": "filled", "page_id": pid, "split_digit_boxes": found["split"],
+               "submitted": bool(submit), "in": where}
+        if skipped:
+            out["skipped_frames"] = skipped
+        return out
+
+    def _passkey_binding(source, payload):
+        """Playwright binding: runs in Python when a page calls navigator.credentials.
+
+        The origin comes from the browser-reported URL of the calling frame
+        (`source["frame"].url`), not from anything the page sent. Playwright's
+        Python API hands `source` over as a dict with context/page/frame keys.
+        """
+        name = _session.passkey_account
+        if not name:
+            return passkeys_mod.handle(None, "", [], payload, False)
+        try:
+            site = accounts_mod.site_of(name)
+            allowed = [site] if site else []
+            allowed += accounts_mod.frame_hosts_of(name)
+        except accounts_mod.AccountError:
+            return {"error": "NotAllowedError", "message": "Passkey account no longer exists."}
+        frame = source["frame"]
+        cross = frame is not source["page"].main_frame
+        reply = passkeys_mod.handle(name, frame.url, allowed, payload, cross)
+        if reply.get("ok") and payload.get("kind") == "create":
+            try:
+                accounts_mod.set_credentials_flag(name, True, key="passkeys")
+            except accounts_mod.AccountError:
+                pass
+        return reply
+
+    @mcp.tool()
+    async def camoufox_passkey_enable(name: str | None = None) -> dict[str, Any]:
+        """Turn on the software passkey authenticator for an account (or turn it off).
+
+        While enabled, websites that ask for a passkey (WebAuthn
+        navigator.credentials.create/get) are answered by this authenticator
+        instead of the browser: it registers new passkeys and signs in with saved
+        ones, with private keys stored only in the OS keychain. Pass name=None to
+        disable (the browser's native behaviour returns).
+
+        To register a passkey: log in normally, save the account
+        (camoufox_save_account), enable it here, reload the page, then use the
+        site's own "add a passkey" flow. To sign in: enable, reload, and use the
+        site's "sign in with a passkey" button.
+
+        It only answers for pages on the account's own site (or hosts trusted via
+        camoufox_allow_login_frame), and declines everything else as if the user
+        cancelled. It is a SOFTWARE authenticator with no hardware attestation:
+        sites that require a hardware security key will refuse it. Reload open
+        pages after enabling. Passkey prompts are answered while the browser is
+        processing a tool call, so follow a click on "use passkey" with any
+        snapshot/wait call.
+
+        Args:
+            name: Existing account (needs a site: save it first). None disables.
+        """
+        if not _session.is_running:
+            return _err("No browser running.", hint="Call camoufox_launch(passkeys=True) first.")
+        if name is not None and not _session.main_world_enabled:
+            return _err(
+                "This browser was not launched with passkey support.",
+                hint="Relaunch with camoufox_launch(passkeys=True, account=...). It has to be "
+                     "chosen at launch because it needs Camoufox's main-world scripting.",
+            )
+        if name is None:
+            _session.passkey_account = None
+            return {"status": "disabled",
+                    "hint": "Browser's native passkey handling is back after a reload."}
+        if not cred_mod.available():
+            return _err("No secure keychain backend available; refusing to hold passkey keys.")
+        try:
+            site = accounts_mod.site_of(name)
+        except accounts_mod.AccountError as exc:
+            return _err(str(exc), hint="Create the account first: camoufox_save_account.")
+        if not site:
+            return _err(f"Account {name!r} has no site recorded, so passkeys cannot be "
+                        "origin-locked.", hint="Re-save it with a site.")
+        loop = asyncio.get_event_loop()
+        try:
+            await loop.run_in_executor(
+                _executor, lambda: _session.install_passkeys_sync(_passkey_binding))
+            count = len(passkeys_mod.load_all(name))
+        except Exception as exc:  # noqa: BLE001
+            return _err(f"Could not enable passkeys: {type(exc).__name__}: {exc}")
+        _session.passkey_account = name
+        return {"status": "enabled", "account": name, "site": site,
+                "trusted_frame_hosts": accounts_mod.frame_hosts_of(name),
+                "saved_passkeys": count,
+                "hint": "Reload the page, then use the site's passkey button."}
+
+    @mcp.tool()
+    async def camoufox_passkey_list(name: str | None = None) -> dict[str, Any]:
+        """List an account's passkeys (never the keys) and recent authenticator decisions.
+
+        `recent_events` records every grant AND refusal (e.g. a page that was not
+        the account's site), so "why didn't the passkey work?" has an answer.
+        Defaults to the currently enabled account.
+        """
+        name = name or _session.passkey_account
+        if not name:
+            return _err("No account given and none enabled.")
+        try:
+            items = passkeys_mod.load_all(name)
+        except cred_mod.CredentialError as exc:
+            return _err(str(exc))
+        return {"status": "ok", "account": name,
+                "enabled": _session.passkey_account == name,
+                "passkeys": [passkeys_mod.public_info(i) for i in items],
+                "recent_events": list(passkeys_mod.EVENTS)}
+
+    @mcp.tool()
+    async def camoufox_passkey_delete(name: str, credential_id: str | None = None) -> dict[str, Any]:
+        """Delete one passkey (by credential_id from camoufox_passkey_list) or all of an account's.
+
+        This only removes OUR copy. The site still lists the passkey until you
+        remove it in the site's own security settings.
+        """
+        try:
+            items = passkeys_mod.load_all(name)
+            keep = [i for i in items if credential_id and i["id"] != credential_id]
+            if credential_id and len(keep) == len(items):
+                return _err("No passkey with that credential_id.")
+            passkeys_mod.save_all(name, keep)
+        except cred_mod.CredentialError as exc:
+            return _err(str(exc))
+        if not keep:
+            try:
+                accounts_mod.set_credentials_flag(name, False, key="passkeys")
+            except accounts_mod.AccountError:
+                pass
+        return {"status": "deleted", "removed": len(items) - len(keep), "remaining": len(keep)}
+
+    @mcp.tool()
+    async def camoufox_allow_login_frame(
+        name: str, host: str, remove: bool = False,
+    ) -> dict[str, Any]:
+        """Trust a third-party iframe host for an account's autofill.
+
+        Autofill searches the top page and iframes from the account's own site.
+        A login embedded from ANOTHER domain (an SSO vendor, an identity
+        provider) is refused by default, because otherwise any page could embed a
+        hostile frame and be handed the password. If you know the embedded
+        domain is the legitimate login for this account, allow exactly that
+        host here. The top-level page must still be the account's own site.
+
+        Args:
+            name: Saved account.
+            host: Frame host, e.g. "auth.sso-vendor.com" (subdomains match too).
+            remove: Withdraw the trust instead.
+        """
+        try:
+            current = accounts_mod.frame_hosts_of(name)
+        except accounts_mod.AccountError as exc:
+            return _err(str(exc))
+        h = _clean_hosts([host])
+        if not h:
+            return _err("Invalid host.", hint='Pass a bare hostname like "auth.example.com".')
+        h = h[0]
+        new = [x for x in current if x != h] if remove else sorted(set(current) | {h})
+        accounts_mod.set_field(name, "frame_hosts", new)
+        return {"status": "removed" if remove else "allowed", "account": name,
+                "trusted_frame_hosts": new}
 
     @mcp.tool()
     async def camoufox_set_cookies(cookies_json: str) -> dict[str, Any]:

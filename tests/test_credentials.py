@@ -78,6 +78,8 @@ class FakePage:
         self.found = found or {"user": True, "password": True}
         self.values = values or {"username": "alice", "password": "s3cret"}
         self.filled, self.pressed = {}, []
+        self.main_frame = self      # a page is its own main frame in these fakes
+        self.frames = [self]
 
     def evaluate(self, js):
         return self.found if js is cred.FIND_LOGIN_JS else self.values
@@ -92,6 +94,7 @@ class FakePage:
 class FakeSession:
     is_running = True
     account_name = None
+    passkey_account = None
     active_page_id = "p1"
 
     def __init__(self, page):

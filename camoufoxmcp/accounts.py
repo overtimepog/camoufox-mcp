@@ -129,6 +129,9 @@ def save(
         # Only a marker. The secret itself is in the OS keychain (credentials.py).
         "credentials": bool(prior.get("credentials", False)),
         "totp": bool(prior.get("totp", False)),
+        "passkeys": bool(prior.get("passkeys", False)),
+        # Third-party iframe hosts the user explicitly trusts for autofill.
+        "frame_hosts": list(prior.get("frame_hosts") or []),
         "storage_state": state,
     }
 
@@ -152,9 +155,18 @@ def save(
 
 def set_credentials_flag(name: str, value: bool, key: str = "credentials") -> None:
     """Record whether this account has keychain credentials (or, with
-    ``key="totp"``, a TOTP secret). Marker only -- the secret is not here."""
+    ``key="totp"`` / ``"passkeys"``, a TOTP secret / passkeys). Marker only --
+    the secret is not here."""
+    set_field(name, key, bool(value))
+
+
+def frame_hosts_of(name: str) -> list[str]:
+    return list(_read(name).get("frame_hosts") or [])
+
+
+def set_field(name: str, key: str, value: Any) -> None:
     record = _read(name)
-    record[key] = bool(value)
+    record[key] = value
     d = _ensure_dir()
     fd, tmp = tempfile.mkstemp(dir=d, prefix=f".{name}.", suffix=".tmp")
     try:
@@ -207,6 +219,8 @@ def describe_record(record: dict[str, Any]) -> dict[str, Any]:
         "notes": record.get("notes"),
         "has_credentials": bool(record.get("credentials")),
         "has_totp": bool(record.get("totp")),
+        "has_passkeys": bool(record.get("passkeys")),
+        "trusted_frame_hosts": list(record.get("frame_hosts") or []),
         "created": record.get("created"),
         "updated": record.get("updated"),
         "cookie_count": len(cookies),

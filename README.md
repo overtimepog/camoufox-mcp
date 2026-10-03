@@ -51,13 +51,13 @@ Tier 2 uses FlareSolverr (Docker-based headless Chromium) to bypass Turnstile, J
 # First Tier 2 call auto-pulls the image and starts the container.
 ```
 
-## Tools (56 total)
+## Tools (60 total)
 
 ### Browser Lifecycle
 
 | Tool | Description |
 |------|-------------|
-| `camoufox_launch` | Start stealth browser (Firefox-based Playwright). Accepts `headers`/`header_scope`, `tor=True` (+ `tor_isolation`, `tor_exit_nodes`), `hardened=True`, and `account="name"` (start already logged in) — see [Tor](#tor) and [Hardened Mode](#hardened-mode) for what each does and does not buy. |
+| `camoufox_launch` | Start stealth browser (Firefox-based Playwright). Accepts `headers`/`header_scope`, `tor=True` (+ `tor_isolation`, `tor_exit_nodes`), `hardened=True`, and `account="name"` (start already logged in), `passkeys=True` (allow the software passkey authenticator) — see [Tor](#tor) and [Hardened Mode](#hardened-mode) for what each does and does not buy. |
 | `camoufox_set_headers` | Set, replace, or clear custom request headers on a live session |
 | `camoufox_get_headers` | Report the header policy in force (values masked unless `reveal=True`) |
 | `camoufox_resize_viewport` | Resize viewport; in headed mode, relaunches Camoufox with matching fingerprint window and restores cookies/URLs |
@@ -126,6 +126,10 @@ Log in once, save the session under a name, and restore it later without touchin
 | `camoufox_delete_account` | Remove a saved account from the vault (and its keychain password) |
 | `camoufox_save_credentials` | Store username + password in the **OS keychain** for autofill. `from_page=True` (default) reads them from the login form you filled in, so the password never passes through the conversation |
 | `camoufox_autofill` | Fill the login form on the current page from saved credentials (`submit=True` presses Enter). Handles two-step logins. Refuses on any page that isn't the account's site |
+| `camoufox_allow_login_frame` | Trust one third-party iframe host for an account's autofill (login widgets embedded from another domain). Refused by default |
+| `camoufox_passkey_enable` | Turn the software passkey authenticator on for an account (`name=None` turns it off). Needs `camoufox_launch(passkeys=True)` |
+| `camoufox_passkey_list` | An account's passkeys (never the keys) + recent grant/refusal decisions |
+| `camoufox_passkey_delete` | Delete one passkey, or all of an account's |
 | `camoufox_forget_credentials` | Remove the saved password **and TOTP secret**; keeps the session |
 | `camoufox_save_totp` | Store an authenticator secret (base32 key or `otpauth://` URI) in the keychain for 2FA |
 | `camoufox_autofill_totp` | Enter the current 2FA code into the page's verification field (single box or one-digit-per-box). Waits out a window about to roll over. Origin-locked; code never returned |
@@ -158,7 +162,42 @@ camoufox_save_account("example-alice")           # refresh the saved session
 - **Passwords live only in the OS keychain** (macOS Keychain, Windows Credential Locker, Secret Service/KWallet) via `keyring`. Never in the vault JSON, never in a tool result. With no secure keychain, saving is **refused** — there is no plaintext fallback.
 - **Keep the password out of the chat.** Use `from_page=True`: the values are read from the form fields in the browser. Passing `password=` explicitly works but puts it in the conversation history.
 - **Origin-bound.** Autofill only runs when the page host is the account's `site` (or a subdomain). `evilexample.com` does not match `example.com`. Without this, a lookalike page could talk an agent into handing over the real password.
-- **Scope.** Fills visible username/password fields on the top-level page, including two-step flows (run it on each step). It does not fill inside cross-origin iframes or handle passkeys / SMS / push approval.
+- **Scope.** Fills visible username/password fields on the top page **and in iframes** (see below), including two-step flows (run it on each step). SMS and push approval are not handled; passkeys are covered by the [passkey authenticator](#passkeys).
+
+#### Logins inside iframes
+
+Embedded logins (an SSO widget, an identity provider's frame) are found automatically. Playwright can run code in any frame, so the finding is easy; the hard part is trust, because handing a password to whatever frame is on the page would let any page harvest it by embedding a hostile one. So:
+
+- The **top-level page must still be the account's site**, always.
+- Frames from the account's own site (including subdomains) are searched automatically.
+- A frame from **any other domain is refused**, and the result names it: `Refused third-party iframe(s): auth.sso-vendor.com … trust it with camoufox_allow_login_frame(name, host)`. If that really is the account's login, allow exactly that host. `camoufox_allow_login_frame(name, host, remove=True)` withdraws it. Passing `frame_hosts=[...]` to `camoufox_save_credentials` does the same at save time.
+- Hidden / zero-size frames are ignored, and `about:blank` / `srcdoc` frames carry no site identity so they are never searched.
+- The result says where it filled (`"in": "login.example.com"`), and the same rules apply to `camoufox_autofill_totp`.
+
+#### Passkeys
+
+```
+camoufox_launch(passkeys=True, display_mode="headed")   # must be chosen at launch
+...log in normally...
+camoufox_save_account("example-alice")                   # gives the account a site to lock to
+camoufox_passkey_enable("example-alice")
+camoufox_navigate(page, "https://example.com/security")  # (re)load, then use the site's own
+                                                          # "Add a passkey" button
+...later, any session...
+camoufox_launch(passkeys=True, account="example-alice")
+camoufox_passkey_enable("example-alice")
+# click the site's "Sign in with a passkey" button
+```
+
+A **software authenticator**: while enabled, a site's `navigator.credentials.create/get` (publicKey) is answered by this server instead of the browser. It generates ES256 keys, signs assertions, and keeps the private keys **only in the OS keychain**. Disabled (`camoufox_passkey_enable()` with no name), the browser's native behaviour returns.
+
+- **Origin-locked.** It answers only for the account's own site (or hosts trusted with `camoufox_allow_login_frame`) and declines everything else as if the user cancelled. The origin is taken from the browser-reported frame URL, never from anything the page sends. `rpId` must be the origin's host or a parent domain (the WebAuthn rule); IP addresses and bare TLDs are refused; plain `http` is refused except `localhost`.
+- **Auditable.** `camoufox_passkey_list` shows every grant *and refusal* with the reason, so "why didn't it work?" has an answer.
+- **No plaintext, ever.** With no secure keychain, creating a passkey is refused. Keys are persisted *before* the site is answered, so a failure can't leave a registered-but-lost passkey.
+- **Honest about what it is.** Attestation is `none`; it does not claim to be a hardware key. A site that *requires* a hardware security key (some enterprise policies) will refuse it — that is not a bug to route around. Counter is always 0, which sites accept. Our copy is separate from the site's: delete a passkey in the site's security settings too.
+- **Why `passkeys=True` at launch.** Camoufox runs Playwright init scripts in an isolated world the page can't see, so the shim has to be injected into the page's own world, which needs Camoufox's `main_world_eval`. That is off by default so the baseline browser stays exactly stock Camoufox. (Verified against Camoufox 152, including pages with a strict `Content-Security-Policy`; script-element injection and `eval`-based injection do *not* work there.)
+- **Timing.** Passkey requests are answered while the browser is processing a tool call, so after clicking a site's passkey button, follow it with any snapshot/wait call.
+- **Not covered.** Hardware-key-only sites, cross-device (QR/hybrid) flows, and resident-key management UIs.
 
 #### 2FA (authenticator codes)
 
@@ -545,7 +584,7 @@ camoufox-mcp/
 ├── camoufoxmcp/
 │   ├── __init__.py              # v0.9.0
 │   ├── __main__.py              # Entry point
-│   ├── server.py                # FastMCP server + 56 tool definitions
+│   ├── server.py                # FastMCP server + 60 tool definitions
 │   ├── session.py               # BrowserSession: lifecycle, dialogs, console, cookies, tabs
 │   ├── snapshot.py              # Accessibility-tree snapshot + CSS selector ref resolution
 │   ├── markdown.py              # trafilatura + regex fallback markdown extraction
@@ -553,6 +592,8 @@ camoufox-mcp/
 │   ├── tor.py                   # Tor control protocol, managed instance, exit verification
 │   ├── observe.py               # Blocker taxonomy, page fingerprint, deterministic checks
 │   ├── accounts.py              # Account vault: named, re-usable saved logins (0600 files)
+│   ├── frames.py                # Find login/2FA fields across top page + trusted iframes
+│   ├── passkeys.py              # Software WebAuthn authenticator (keys in keychain, origin-locked)
 │   ├── credentials.py           # Keychain-backed username/password storage + login-field detection for autofill
 │   ├── hardening.py             # Hardened mode: pinned fingerprint + RFP (not anonymity)
 │   ├── cloudscraper_bridge.py   # Tier 1: HTTP JS solver + cookie injection

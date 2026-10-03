@@ -91,6 +91,7 @@ def _call(name, args):
 class FakeSession:
     is_running = True
     account_name = None
+    passkey_account = None
 
     def __init__(self):
         self.imported = None

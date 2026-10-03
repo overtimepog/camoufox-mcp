@@ -108,6 +108,7 @@ def _build_launch_options(
         locale=cfg.locale,
         proxy=proxy_cfg,
         window=window,
+        main_world_eval=True if cfg.main_world_eval else None,
         **hard,
     )
 
@@ -344,6 +345,10 @@ class SessionConfig:
     # per-launch randomiser Camoufox owns. See hardening.py -- this reduces
     # uniqueness, it is not anonymity.
     hardened: bool = False
+    # Run "mw:" scripts in the page's own world. Required by the passkey
+    # authenticator (see passkeys.py); off by default so the baseline browser is
+    # exactly stock Camoufox.
+    main_world_eval: bool = False
 
 
 class BrowserSession:
@@ -374,6 +379,12 @@ class BrowserSession:
         # Name of the vault account this session was launched from or loaded,
         # so close can write refreshed tokens back. None for an anonymous session.
         self.account_name: str | None = None
+        # Software passkey authenticator. The shim + binding are installed on
+        # the context once, the first time passkeys are enabled; `passkey_account`
+        # is which account's keys answer (None = pass through to the browser).
+        self.passkey_account: str | None = None
+        self._passkey_handler: Any = None
+        self._passkey_installed: bool = False
 
         # Custom request headers, and the route handler enforcing them. The
         # handler is kept so a later set_http_headers() can unroute exactly the
@@ -405,6 +416,10 @@ class BrowserSession:
     @property
     def is_running(self) -> bool:
         return self._browser is not None and self._context is not None
+
+    @property
+    def main_world_enabled(self) -> bool:
+        return bool(self._last_config and self._last_config.main_world_eval)
 
     @property
     def display_mode(self) -> str:
@@ -873,6 +888,10 @@ class BrowserSession:
         # it, which is the exact failure the feature exists to prevent.
         self._header_route_installed = False
         self._apply_http_headers_sync(cfg.http_headers, cfg.header_scope)
+        # Same reason: the shim lived on the old context.
+        if self._passkey_handler is not None:
+            self._passkey_installed = False
+            self.install_passkeys_sync(self._passkey_handler)
 
         restored = 0
         pages_to_restore = old_pages or [{"page_id": f"page_{uuid.uuid4().hex[:8]}", "url": "about:blank", "active": True}]
@@ -1011,6 +1030,32 @@ class BrowserSession:
     # Cookie management
     # ------------------------------------------------------------------
 
+    def install_passkeys_sync(self, handler: Any) -> None:
+        """Install the passkey shim on the live context (idempotent).
+
+        ``handler(source, payload)`` runs in Python when a page calls
+        navigator.credentials. Open pages get the shim immediately; new pages and
+        navigations get it from the init script. Must run in the executor thread.
+        """
+        from . import passkeys
+
+        self._passkey_handler = handler
+        if self._passkey_installed:
+            return
+        self._context.expose_binding("__cmcpPasskey", handler)
+        self._context.add_init_script(passkeys.BRIDGE_JS)
+        self._context.add_init_script(passkeys.MAIN_INIT_JS)
+        for page in list(self._context.pages):
+            if page.is_closed():
+                continue
+            for frame in page.frames:
+                try:
+                    frame.evaluate(passkeys.BRIDGE_JS)
+                    frame.evaluate(passkeys.MAIN_INIT_JS)
+                except Exception:  # noqa: BLE001 - detached / not-yet-loaded frame
+                    pass
+        self._passkey_installed = True
+
     def export_storage_state(self) -> dict[str, Any]:
         """Cookies + localStorage of the live context (Playwright storage_state)."""
         return self._context.storage_state()
@@ -1099,6 +1144,9 @@ class BrowserSession:
         self._browser = None
         self._context = None
         self.account_name = None
+        self.passkey_account = None
+        self._passkey_handler = None
+        self._passkey_installed = False
         logger.info("Camoufox browser closed")
 
     def _force_cleanup(self) -> None:
