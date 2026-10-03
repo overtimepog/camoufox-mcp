@@ -51,7 +51,7 @@ Tier 2 uses FlareSolverr (Docker-based headless Chromium) to bypass Turnstile, J
 # First Tier 2 call auto-pulls the image and starts the container.
 ```
 
-## Tools (51 total)
+## Tools (54 total)
 
 ### Browser Lifecycle
 
@@ -123,7 +123,10 @@ Log in once, save the session under a name, and restore it later without touchin
 | `camoufox_save_account` | Save the live login as `name` (+ optional `site`, `username` label, `notes`). Re-saving refreshes the session and keeps old metadata |
 | `camoufox_list_accounts` | List saved accounts: site, cookie domains, expiry. Never shows cookie/storage values. Optional `site` filter |
 | `camoufox_load_account` | Apply a saved account to the *running* browser (cookies now, localStorage on next page load — navigate after) |
-| `camoufox_delete_account` | Remove a saved account from the vault |
+| `camoufox_delete_account` | Remove a saved account from the vault (and its keychain password) |
+| `camoufox_save_credentials` | Store username + password in the **OS keychain** for autofill. `from_page=True` (default) reads them from the login form you filled in, so the password never passes through the conversation |
+| `camoufox_autofill` | Fill the login form on the current page from saved credentials (`submit=True` presses Enter). Handles two-step logins. Refuses on any page that isn't the account's site |
+| `camoufox_forget_credentials` | Remove the saved password; keeps the session |
 
 `camoufox_launch(account="name")` restores the session at context creation. An account-bound session is **re-saved on `camoufox_close`**, so tokens the site refreshed while you worked persist. If the live session is empty at close (the site logged you out), the previous good login is kept rather than overwritten.
 
@@ -134,6 +137,26 @@ camoufox_close()
 ...later...
 camoufox_launch(account="github-alice")     # already logged in
 ```
+
+#### Autofill
+
+Sessions expire. For hands-off re-login, save the credentials once:
+
+```
+camoufox_launch(display_mode="headed")
+camoufox_navigate(page, "https://example.com/login")
+# type your username and password into the form yourself
+camoufox_save_credentials("example-alice")       # reads them from the form; stored in the OS keychain
+...later, session expired...
+camoufox_navigate(page, "https://example.com/login")
+camoufox_autofill("example-alice", submit=True)  # fills + presses Enter
+camoufox_save_account("example-alice")           # refresh the saved session
+```
+
+- **Passwords live only in the OS keychain** (macOS Keychain, Windows Credential Locker, Secret Service/KWallet) via `keyring`. Never in the vault JSON, never in a tool result. With no secure keychain, saving is **refused** — there is no plaintext fallback.
+- **Keep the password out of the chat.** Use `from_page=True`: the values are read from the form fields in the browser. Passing `password=` explicitly works but puts it in the conversation history.
+- **Origin-bound.** Autofill only runs when the page host is the account's `site` (or a subdomain). `evilexample.com` does not match `example.com`. Without this, a lookalike page could talk an agent into handing over the real password.
+- **Scope.** Fills visible username/password fields on the top-level page, including two-step flows (run it on each step). It does not solve MFA/TOTP prompts or fill inside cross-origin iframes.
 
 **Security.** A saved session is a credential: anyone who can read the file can act as that account. Files live in `~/.camoufoxmcp/accounts/` (override with `CAMOUFOX_MCP_ACCOUNTS_DIR`), directory `0700`, files `0600`, written atomically. Account names are restricted to `[A-Za-z0-9._-]` so a name can never address a file outside the vault. Sites can still expire a session server-side; when that happens, log in again and re-save. `account` cannot be combined with `user_data_dir` (a whole browser profile) — pick one.
 
@@ -509,7 +532,7 @@ camoufox-mcp/
 ├── camoufoxmcp/
 │   ├── __init__.py              # v0.9.0
 │   ├── __main__.py              # Entry point
-│   ├── server.py                # FastMCP server + 51 tool definitions
+│   ├── server.py                # FastMCP server + 54 tool definitions
 │   ├── session.py               # BrowserSession: lifecycle, dialogs, console, cookies, tabs
 │   ├── snapshot.py              # Accessibility-tree snapshot + CSS selector ref resolution
 │   ├── markdown.py              # trafilatura + regex fallback markdown extraction
@@ -517,6 +540,7 @@ camoufox-mcp/
 │   ├── tor.py                   # Tor control protocol, managed instance, exit verification
 │   ├── observe.py               # Blocker taxonomy, page fingerprint, deterministic checks
 │   ├── accounts.py              # Account vault: named, re-usable saved logins (0600 files)
+│   ├── credentials.py           # Keychain-backed username/password storage + login-field detection for autofill
 │   ├── hardening.py             # Hardened mode: pinned fingerprint + RFP (not anonymity)
 │   ├── cloudscraper_bridge.py   # Tier 1: HTTP JS solver + cookie injection
 │   └── flaresolverr_bridge.py   # Tier 2: solve, fetch (raw + text), links, Docker mgmt

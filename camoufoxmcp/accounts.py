@@ -96,11 +96,16 @@ def save(
     site: str | None = None,
     username: str | None = None,
     notes: str | None = None,
+    allow_empty: bool = False,
 ) -> dict[str, Any]:
-    """Write (or refresh) an account. Metadata not passed is kept from before."""
+    """Write (or refresh) an account. Metadata not passed is kept from before.
+
+    ``allow_empty`` permits an account with no session yet -- used when only
+    credentials were saved and the first login has not happened.
+    """
     path = _path(name)
     state = _normalise_state(state)
-    if not state["cookies"] and not state["origins"]:
+    if not allow_empty and not state["cookies"] and not state["origins"]:
         raise AccountError(
             "The session has no cookies or localStorage to save. Log in first, "
             "then save."
@@ -121,6 +126,8 @@ def save(
         "notes": notes if notes is not None else prior.get("notes"),
         "created": prior.get("created", now),
         "updated": now,
+        # Only a marker. The secret itself is in the OS keychain (credentials.py).
+        "credentials": bool(prior.get("credentials", False)),
         "storage_state": state,
     }
 
@@ -140,6 +147,29 @@ def save(
             pass
         raise
     return describe_record(record)
+
+
+def set_credentials_flag(name: str, value: bool) -> None:
+    """Record whether this account has keychain credentials. Marker only."""
+    record = _read(name)
+    record["credentials"] = bool(value)
+    d = _ensure_dir()
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=f".{name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(record, fh)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, _path(name))
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def site_of(name: str) -> str | None:
+    return _read(name).get("site")
 
 
 def _read(name: str) -> dict[str, Any]:
@@ -173,6 +203,7 @@ def describe_record(record: dict[str, Any]) -> dict[str, Any]:
         "site": record.get("site"),
         "username": record.get("username"),
         "notes": record.get("notes"),
+        "has_credentials": bool(record.get("credentials")),
         "created": record.get("created"),
         "updated": record.get("updated"),
         "cookie_count": len(cookies),

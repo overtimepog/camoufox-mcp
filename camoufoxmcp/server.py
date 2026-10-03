@@ -17,6 +17,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from urllib.parse import urlparse
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -33,6 +34,7 @@ from .observe import (
     CHECK_NAMES,
 )
 from . import accounts as accounts_mod
+from . import credentials as cred_mod
 from . import hardening
 from . import tor as tor_mod
 from .markdown import extract_markdown
@@ -1536,10 +1538,199 @@ def create_server(caps: set[str] | None = None):
             accounts_mod.delete(name)
         except accounts_mod.AccountError as exc:
             return _err(str(exc))
+        forgot = cred_mod.delete(name)
         if _session.account_name == name:
             # Otherwise close would silently re-create what was just deleted.
             _session.account_name = None
-        return {"status": "deleted", "account": name}
+        return {"status": "deleted", "account": name, "credentials_removed": forgot}
+
+    @mcp.tool()
+    async def camoufox_save_credentials(
+        name: str,
+        page_id: str | None = None,
+        from_page: bool = True,
+        username: str | None = None,
+        password: str | None = None,
+        site: str | None = None,
+    ) -> dict[str, Any]:
+        """Store a username + password in the OS keychain for autofill.
+
+        PREFERRED: type the credentials into the login form yourself (headed
+        mode), then call this with from_page=True (default). They are read
+        straight from the form fields and never pass through the conversation.
+        Alternatively pass username= and password= explicitly -- but then the
+        password is visible in this conversation's history, so avoid it for
+        anything valuable.
+
+        Stored in the macOS Keychain / Windows Credential Locker / Secret
+        Service via `keyring`; NEVER in a file. If no secure keychain exists this
+        is refused. Autofill later only works on pages of this account's site.
+
+        Args:
+            name: Account name (same namespace as camoufox_save_account).
+            page_id: Page holding the filled-in form (default: active page).
+            from_page: Read username/password from the visible login form.
+            username/password: Explicit values (overrides from_page).
+            site: Site these belong to. Defaults to the current page's host.
+        """
+        try:
+            accounts_mod.validate_name(name)
+        except accounts_mod.AccountError as exc:
+            return _err(str(exc))
+        if not cred_mod.available():
+            return _err(
+                "No secure keychain backend available; refusing to store a password.",
+                hint="Install/enable a system keychain (macOS Keychain works out of the box).",
+            )
+        explicit = username is not None or password is not None
+        page_url = None
+        if not explicit:
+            if not from_page:
+                return _err("Provide username and password, or use from_page=True.")
+            if not _session.is_running:
+                return _err("No browser running.", hint="Fill in the login form first.")
+            try:
+                page, _ = _resolve_page(page_id)
+            except (BrowserSessionError, KeyError) as exc:
+                return _err(str(exc))
+            loop = asyncio.get_event_loop()
+
+            def _read():
+                found = page.evaluate(cred_mod.FIND_LOGIN_JS)
+                vals = page.evaluate(cred_mod.READ_LOGIN_JS)
+                return found, vals, page.url
+
+            found, vals, page_url = await loop.run_in_executor(_executor, _read)
+            username, password = vals.get("username"), vals.get("password")
+            if not username or not password:
+                return _err(
+                    "Could not read both a username and a password from the page "
+                    f"(found fields: {cred_mod.describe(found)}; "
+                    f"username filled: {bool(username)}, password filled: {bool(password)}).",
+                    hint="Fill both fields on one page, or pass them explicitly. "
+                         "Two-step logins: fill the username, then save on the "
+                         "password page after typing the password.",
+                )
+        if page_url is None and _session.is_running:
+            try:
+                page_url = _resolve_page(page_id)[0].url
+            except Exception:  # noqa: BLE001
+                page_url = None
+        site_val = site or (urlparse(page_url).hostname if page_url else None)
+        if not site_val:
+            return _err("Could not determine the site.", hint="Pass site=\"example.com\".")
+
+        try:
+            cred_mod.save(name, username, password)
+        except cred_mod.CredentialError as exc:
+            return _err(str(exc))
+
+        # Metadata record (no secrets). Keep an existing session if there is one.
+        try:
+            try:
+                state = accounts_mod.load_state(name)
+            except accounts_mod.AccountError:
+                state = {"cookies": [], "origins": []}
+            accounts_mod.save(name, state, site=site_val, username=username,
+                              allow_empty=True)
+            accounts_mod.set_credentials_flag(name, True)
+        except accounts_mod.AccountError as exc:
+            cred_mod.delete(name)
+            return _err(str(exc))
+        return {
+            "status": "saved",
+            "account": name,
+            "site": site_val,
+            "username": username,
+            "password_stored": "keychain",
+            "hint": "camoufox_autofill(name) fills the login form on this site.",
+        }
+
+    @mcp.tool()
+    async def camoufox_autofill(
+        name: str,
+        page_id: str | None = None,
+        submit: bool = False,
+    ) -> dict[str, Any]:
+        """Fill the login form on the current page from a saved account's credentials.
+
+        Fills whatever login fields are visible: username, password, or both
+        (two-step logins: run it on the username page, submit, then run it
+        again on the password page). Values are never returned. With
+        submit=True, presses Enter in the last filled field.
+
+        Safety: refused unless the page's host is the account's site (or a
+        subdomain), so a lookalike phishing page is never given the password.
+        Use camoufox_save_credentials first.
+
+        Args:
+            name: Saved account name.
+            page_id: Page to fill (default: active page).
+            submit: Press Enter after filling.
+        """
+        if not _session.is_running:
+            return _err("No browser running.")
+        try:
+            site = accounts_mod.site_of(name)
+        except accounts_mod.AccountError as exc:
+            return _err(str(exc), hint="camoufox_list_accounts() shows what is saved.")
+        try:
+            user_val, pass_val = cred_mod.load(name)
+        except cred_mod.CredentialError as exc:
+            return _err(str(exc), hint="Save them with camoufox_save_credentials().")
+        try:
+            page, pid = _resolve_page(page_id)
+        except (BrowserSessionError, KeyError) as exc:
+            return _err(str(exc))
+        if not site:
+            return _err(f"Account {name!r} has no site recorded, so autofill cannot be "
+                        "origin-checked.", hint="Re-save with camoufox_save_credentials(site=...).")
+        if not cred_mod.host_matches(page.url, site):
+            return _err(
+                f"Refusing to autofill: this page is not {site}.",
+                hint="Autofill only runs on the account's own site, so credentials "
+                     "cannot be handed to a lookalike page.",
+            )
+        loop = asyncio.get_event_loop()
+
+        def _fill():
+            found = page.evaluate(cred_mod.FIND_LOGIN_JS)
+            filled = []
+            if found["user"]:
+                page.fill(cred_mod.USER_SEL, user_val)
+                filled.append("username")
+            if found["password"]:
+                page.fill(cred_mod.PASS_SEL, pass_val)
+                filled.append("password")
+            if submit and filled:
+                page.press(cred_mod.PASS_SEL if found["password"] else cred_mod.USER_SEL, "Enter")
+            return filled
+
+        try:
+            filled = await loop.run_in_executor(_executor, _fill)
+        except Exception as exc:  # noqa: BLE001
+            return _err(f"Autofill failed: {type(exc).__name__}: {exc}")
+        if not filled:
+            return _err("No visible login fields on this page.",
+                        hint="Navigate to the login page first, then call camoufox_autofill().")
+        out: dict[str, Any] = {"status": "filled", "page_id": pid, "filled": filled,
+                               "submitted": bool(submit)}
+        if filled == ["username"]:
+            out["hint"] = ("Only a username field is showing (two-step login). Submit it, "
+                           "then call camoufox_autofill again on the password page.")
+        elif not submit:
+            out["hint"] = "Submit the form (click Sign in, or autofill again with submit=True)."
+        return out
+
+    @mcp.tool()
+    async def camoufox_forget_credentials(name: str) -> dict[str, Any]:
+        """Remove an account's saved password from the keychain. Keeps its session."""
+        removed = cred_mod.delete(name)
+        try:
+            accounts_mod.set_credentials_flag(name, False)
+        except accounts_mod.AccountError:
+            pass
+        return {"status": "forgotten" if removed else "none_stored", "account": name}
 
     @mcp.tool()
     async def camoufox_set_cookies(cookies_json: str) -> dict[str, Any]:
